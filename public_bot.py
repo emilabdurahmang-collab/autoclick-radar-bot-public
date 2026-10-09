@@ -144,6 +144,29 @@ def save_market_request(payload: dict[str, Any]) -> dict[str, Any]:
     return rows[0]
 
 
+def link_request_to_lead(request_id: int, lead_id: int) -> None:
+    (
+        supabase.table("market_requests")
+        .update({"radar_lead_id": lead_id})
+        .eq("id", request_id)
+        .execute()
+    )
+
+
+def find_existing_request_lead(request_id: int) -> dict[str, Any] | None:
+    rows = (
+        supabase.table("leads")
+        .select("*")
+        .contains("raw_data", {"market_request_id": request_id})
+        .order("created_at", desc=True)
+        .limit(1)
+        .execute()
+        .data
+        or []
+    )
+    return rows[0] if rows else None
+
+
 MATCH_THRESHOLD = 70
 
 VEHICLE_ALIASES = {
@@ -358,8 +381,40 @@ def backfill_auto_matches() -> None:
         .data
         or []
     )
+    def signature(row: dict[str, Any]) -> tuple[Any, ...]:
+        price_value = row.get("budget") if row.get("request_type") == "buyer" else row.get("asking_price")
+        try:
+            price_value = int(float(price_value)) if price_value is not None else None
+        except (TypeError, ValueError):
+            pass
+        return (
+            row.get("request_type"),
+            row.get("telegram_user_id"),
+            normalize_city(row.get("city")),
+            normalize_text(row.get("vehicle")),
+            price_value,
+        )
+
+    seen_buyers: set[tuple[Any, ...]] = set()
+    unique_buyers: list[dict[str, Any]] = []
     for buyer in buyers:
-        for seller in sellers:
+        sig = signature(buyer)
+        if sig in seen_buyers:
+            continue
+        seen_buyers.add(sig)
+        unique_buyers.append(buyer)
+
+    seen_sellers: set[tuple[Any, ...]] = set()
+    unique_sellers: list[dict[str, Any]] = []
+    for seller in sellers:
+        sig = signature(seller)
+        if sig in seen_sellers:
+            continue
+        seen_sellers.add(sig)
+        unique_sellers.append(seller)
+
+    for buyer in unique_buyers:
+        for seller in unique_sellers:
             try:
                 insert_match_if_new(buyer, seller)
             except Exception:
@@ -559,6 +614,12 @@ async def finalize_if_both_accepted(match_id: int) -> bool:
 
 
 def save_buyer_as_lead(request_row: dict[str, Any], message: Message) -> dict[str, Any] | None:
+    if request_row.get("id"):
+        existing = find_existing_request_lead(int(request_row["id"]))
+        if existing:
+            link_request_to_lead(int(request_row["id"]), int(existing["id"]))
+            return existing
+
     contact = request_row.get("contact_phone") or request_row.get("contact_telegram") or "не указан"
     budget = request_row.get("budget")
     requirements = request_row.get("requirements") or "без дополнительных требований"
@@ -602,6 +663,12 @@ def save_buyer_as_lead(request_row: dict[str, Any], message: Message) -> dict[st
 
 
 def save_seller_as_lead(request_row: dict[str, Any]) -> dict[str, Any]:
+    if request_row.get("id"):
+        existing = find_existing_request_lead(int(request_row["id"]))
+        if existing:
+            link_request_to_lead(int(request_row["id"]), int(existing["id"]))
+            return existing
+
     contact = request_row.get("contact_phone") or request_row.get("contact_telegram") or "не указан"
     price = request_row.get("asking_price")
     mileage = request_row.get("mileage_km")
@@ -693,8 +760,14 @@ def backfill_seller_radar_leads(limit: int = 50) -> None:
     )
     for row in rows:
         try:
+            request_id = int(row["id"])
+            existing = find_existing_request_lead(request_id)
+            if existing:
+                link_request_to_lead(request_id, int(existing["id"]))
+                log.info("Repaired seller request %s -> existing Radar lead %s", request_id, existing.get("id"))
+                continue
             lead = save_seller_as_lead(row)
-            log.info("Backfilled seller request %s to Radar lead %s", row.get("id"), lead.get("id"))
+            log.info("Backfilled seller request %s to Radar lead %s", request_id, lead.get("id"))
         except Exception:
             log.exception("Could not backfill seller request %s", row.get("id"))
 
@@ -805,12 +878,15 @@ async def buyer_contact(message: Message, state: FSMContext) -> None:
     }
     try:
         row = await asyncio.to_thread(save_market_request, payload)
-        await asyncio.to_thread(save_buyer_as_lead, row, message)
     except Exception:
         log.exception("Failed to save buyer request")
         await message.answer("Не удалось сохранить заявку. Попробуйте ещё раз позже.", reply_markup=MAIN_KB)
         await state.clear()
         return
+    try:
+        await asyncio.to_thread(save_buyer_as_lead, row, message)
+    except Exception:
+        log.exception("Buyer request %s saved, but Radar linkage failed; it will be repaired later", row.get("id"))
     try:
         await asyncio.to_thread(create_matches_for_request, row)
     except Exception:
@@ -921,12 +997,15 @@ async def seller_contact(message: Message, state: FSMContext) -> None:
     }
     try:
         row = await asyncio.to_thread(save_market_request, payload)
-        await asyncio.to_thread(save_seller_as_lead, row)
     except Exception:
         log.exception("Failed to save seller request")
         await message.answer("Не удалось сохранить заявку. Попробуйте ещё раз позже.", reply_markup=MAIN_KB)
         await state.clear()
         return
+    try:
+        await asyncio.to_thread(save_seller_as_lead, row)
+    except Exception:
+        log.exception("Seller request %s saved, but Radar linkage failed; it will be repaired later", row.get("id"))
     try:
         await asyncio.to_thread(create_matches_for_request, row)
     except Exception:
