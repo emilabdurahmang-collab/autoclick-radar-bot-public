@@ -1,5 +1,6 @@
 import asyncio
 import html
+import hashlib
 import logging
 import os
 import re
@@ -140,11 +141,91 @@ def contact_from_message(message: Message) -> tuple[str | None, str | None]:
     return phone, username
 
 
+def _fingerprint_text(value: Any) -> str:
+    text = str(value or "").strip().lower().replace("ё", "е")
+    return " ".join(text.split())
+
+
+def _fingerprint_number(value: Any) -> str:
+    if value in (None, ""):
+        return ""
+    try:
+        return str(int(float(value)))
+    except (TypeError, ValueError):
+        return str(value).strip()
+
+
+def request_fingerprint(payload: dict[str, Any]) -> str:
+    request_type = str(payload.get("request_type") or "")
+    common = [
+        request_type,
+        _fingerprint_text(payload.get("city")),
+        _fingerprint_text(payload.get("vehicle")),
+    ]
+    if request_type == "buyer":
+        parts = common + [
+            _fingerprint_number(payload.get("budget")),
+            _fingerprint_number(payload.get("min_vehicle_year")),
+            _fingerprint_number(payload.get("max_vehicle_year")),
+            _fingerprint_number(payload.get("max_mileage_km")),
+            _fingerprint_text(payload.get("requirements")),
+        ]
+    else:
+        parts = common + [
+            _fingerprint_number(payload.get("vehicle_year")),
+            _fingerprint_number(payload.get("asking_price")),
+            _fingerprint_number(payload.get("mileage_km")),
+        ]
+    canonical = "|".join(parts)
+    return hashlib.md5(canonical.encode("utf-8"), usedforsecurity=False).hexdigest()
+
+
+def find_active_duplicate(payload: dict[str, Any], fingerprint: str) -> dict[str, Any] | None:
+    rows = (
+        supabase.table("market_requests")
+        .select("*")
+        .eq("telegram_user_id", int(payload.get("telegram_user_id") or 0))
+        .eq("request_type", payload.get("request_type"))
+        .eq("request_fingerprint", fingerprint)
+        .in_("status", ["new", "in_progress"])
+        .order("created_at")
+        .limit(1)
+        .execute()
+        .data
+        or []
+    )
+    return rows[0] if rows else None
+
+
 def save_market_request(payload: dict[str, Any]) -> dict[str, Any]:
-    rows = supabase.table("market_requests").insert(payload).execute().data or []
+    payload = dict(payload)
+    fingerprint = request_fingerprint(payload)
+    payload["request_fingerprint"] = fingerprint
+
+    existing = find_active_duplicate(payload, fingerprint)
+    if existing:
+        row = dict(existing)
+        row["_is_duplicate"] = True
+        return row
+
+    try:
+        rows = supabase.table("market_requests").insert(payload).execute().data or []
+    except Exception:
+        # The database also has a unique active-request guard. If two identical
+        # submissions race each other, return the one that won instead of creating
+        # a duplicate or showing a false save error.
+        existing = find_active_duplicate(payload, fingerprint)
+        if existing:
+            row = dict(existing)
+            row["_is_duplicate"] = True
+            return row
+        raise
+
     if not rows:
         raise RuntimeError("market request was not saved")
-    return rows[0]
+    row = dict(rows[0])
+    row["_is_duplicate"] = False
+    return row
 
 
 def link_request_to_lead(request_id: int, lead_id: int) -> None:
@@ -248,6 +329,12 @@ def vehicle_similarity(buyer_vehicle: Any, seller_vehicle: Any) -> float:
 
 
 def evaluate_match(buyer: dict[str, Any], seller: dict[str, Any]) -> tuple[int, dict[str, Any]] | None:
+    # Never connect a Telegram user with their own buy/sell request.
+    buyer_user_id = int(buyer.get("telegram_user_id") or 0)
+    seller_user_id = int(seller.get("telegram_user_id") or 0)
+    if buyer_user_id and seller_user_id and buyer_user_id == seller_user_id:
+        return None
+
     # Year and mileage are mandatory buyer criteria. Legacy buyer requests without
     # them stay in the database but do not create automatic matches.
     min_year = buyer.get("min_vehicle_year")
@@ -415,17 +502,12 @@ def backfill_auto_matches() -> None:
         or []
     )
     def signature(row: dict[str, Any]) -> tuple[Any, ...]:
-        price_value = row.get("budget") if row.get("request_type") == "buyer" else row.get("asking_price")
-        try:
-            price_value = int(float(price_value)) if price_value is not None else None
-        except (TypeError, ValueError):
-            pass
+        # Only true duplicate active requests are collapsed during startup backfill.
+        # Different year/mileage/requirements remain separate requests.
         return (
-            row.get("request_type"),
             row.get("telegram_user_id"),
-            normalize_city(row.get("city")),
-            normalize_text(row.get("vehicle")),
-            price_value,
+            row.get("request_type"),
+            row.get("request_fingerprint") or request_fingerprint(row),
         )
 
     seen_buyers: set[tuple[Any, ...]] = set()
@@ -961,6 +1043,14 @@ async def buyer_contact(message: Message, state: FSMContext) -> None:
         await message.answer("Не удалось сохранить заявку. Попробуйте ещё раз позже.", reply_markup=MAIN_KB)
         await state.clear()
         return
+    if row.get("_is_duplicate"):
+        await state.clear()
+        await message.answer(
+            f"ℹ️ Такая активная заявка уже есть — №{row['id']}. Вторую копию не создаю.",
+            reply_markup=MAIN_KB,
+        )
+        return
+    row.pop("_is_duplicate", None)
     try:
         await asyncio.to_thread(save_buyer_as_lead, row, message)
     except Exception:
@@ -1080,6 +1170,14 @@ async def seller_contact(message: Message, state: FSMContext) -> None:
         await message.answer("Не удалось сохранить заявку. Попробуйте ещё раз позже.", reply_markup=MAIN_KB)
         await state.clear()
         return
+    if row.get("_is_duplicate"):
+        await state.clear()
+        await message.answer(
+            f"ℹ️ Такая активная заявка уже есть — №{row['id']}. Вторую копию не создаю.",
+            reply_markup=MAIN_KB,
+        )
+        return
+    row.pop("_is_duplicate", None)
     try:
         await asyncio.to_thread(save_seller_as_lead, row)
     except Exception:
