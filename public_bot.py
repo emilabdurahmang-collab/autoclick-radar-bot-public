@@ -1,6 +1,7 @@
 import asyncio
 import html
 import hashlib
+import json
 import logging
 import os
 import re
@@ -14,10 +15,12 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
+    BotCommand,
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     KeyboardButton,
+    InputMediaPhoto,
     Message,
     ReplyKeyboardMarkup,
     ReplyKeyboardRemove,
@@ -86,6 +89,38 @@ MAIN_KB = ReplyKeyboardMarkup(
     resize_keyboard=True,
 )
 
+
+START_TEXT = (
+    "🚘 <b>AutoClick — автомобиль найдёт вас</b>\n\n"
+    "Оставьте одну заявку — система сопоставит покупателей и продавцов по автомобилю, "
+    "бюджету, году и пробегу.\n\n"
+    "🔎 <b>Покупателю:</b> укажите, какой автомобиль ищете и ваши условия.\n"
+    "💰 <b>Продавцу:</b> добавьте автомобиль, цену, описание и фото.\n\n"
+    "🔒 Контакты скрыты и открываются только после взаимного интереса.\n"
+    "✅ Размещение заявки бесплатно.\n\n"
+    "<b>Один запрос — больше выбора</b>\n\n"
+    "Что вы хотите сделать?"
+)
+
+HELP_TEXT = (
+    "ℹ️ <b>Как работает AutoClick</b>\n\n"
+    "1️⃣ Создайте заявку на покупку или продажу автомобиля.\n"
+    "2️⃣ AutoClick сравнит параметры заявок.\n"
+    "3️⃣ При подходящем совпадении обе стороны получат предложение.\n"
+    "4️⃣ Контакты откроются только после подтверждения интереса обеими сторонами.\n\n"
+    "Ваш телефон не публикуется открыто. Заявку можно изменить или закрыть через «📋 Мои заявки».\n\n"
+    "Команды: /buy — купить, /sell — продать, /my — мои заявки, /help — помощь."
+)
+
+BOT_COMMANDS = [
+    BotCommand(command="start", description="Главное меню"),
+    BotCommand(command="buy", description="Хочу купить авто"),
+    BotCommand(command="sell", description="Хочу продать авто"),
+    BotCommand(command="my", description="Мои заявки"),
+    BotCommand(command="help", description="Как работает AutoClick"),
+    BotCommand(command="cancel", description="Отменить текущее действие"),
+]
+
 CONTACT_KB = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="📱 Отправить номер телефона", request_contact=True)],
@@ -100,6 +135,13 @@ SKIP_KB = ReplyKeyboardMarkup(
     resize_keyboard=True,
     one_time_keyboard=True,
 )
+
+PHOTO_KB = ReplyKeyboardMarkup(
+    keyboard=[[KeyboardButton(text="✅ Готово")], [KeyboardButton(text="Пропустить")]],
+    resize_keyboard=True,
+)
+
+MAX_SELLER_PHOTOS = 5
 
 
 def parse_money(text: str) -> int | None:
@@ -123,6 +165,22 @@ def parse_money(text: str) -> int | None:
 def parse_int(text: str) -> int | None:
     digits = re.sub(r"\D", "", text)
     return int(digits) if digits else None
+
+def seller_photo_ids(row: dict[str, Any]) -> list[str]:
+    value = row.get("photo_file_ids")
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except Exception:
+            value = []
+    photos = [str(x) for x in (value or []) if x]
+    if not photos and row.get("photo_file_id"):
+        photos = [str(row["photo_file_id"])]
+    return photos[:MAX_SELLER_PHOTOS]
+
+
+def seller_photo_count(row: dict[str, Any]) -> int:
+    return len(seller_photo_ids(row))
 
 
 def user_identity(message: Message) -> dict[str, Any]:
@@ -684,7 +742,7 @@ def request_card(row: dict[str, Any]) -> str:
             f"🛣 Пробег: {esc(row.get('mileage_km'))} км",
             f"⚙️ Комплектация: {esc(row.get('vehicle_trim') or 'не указана')}",
             f"📝 Описание: {esc(row.get('seller_description') or 'нет')}",
-            f"📷 Фото: {'добавлено' if row.get('photo_file_id') else 'нет'}",
+            f"📷 Фото: {seller_photo_count(row) if seller_photo_count(row) else 'нет'}",
         ])
     return "\n".join(body)
 
@@ -743,7 +801,7 @@ def edit_field_prompt(field: str) -> str:
         "mileage_km": "Введите новый пробег автомобиля, например 85000.",
         "vehicle_trim": "Введите комплектацию автомобиля, например M Sport, Elegance или Comfort. Если не хотите указывать — напишите «Пропустить».",
         "seller_description": "Введите краткое описание автомобиля: состояние, владельцы, ДТП, обслуживание и важные особенности. До 1000 символов. Если не хотите указывать — напишите «Пропустить».",
-        "photo_file_id": "Отправьте главное фото автомобиля. Чтобы удалить текущее фото — напишите «Удалить».",
+        "photo_file_id": "Отправьте новое главное фото автомобиля. Оно заменит текущую фотогалерею. Чтобы удалить все фото — напишите «Удалить».",
         "contact": "Отправьте новый телефон или @username.",
     }
     return prompts.get(field, "Введите новое значение.")
@@ -781,7 +839,7 @@ def sync_request_lead(row: dict[str, Any]) -> None:
             f"Пробег: {row.get('mileage_km')} км. "
             f"Комплектация: {row.get('vehicle_trim') or 'не указана'}. "
             f"Описание: {row.get('seller_description') or 'нет'}. "
-            f"Фото: {'есть' if row.get('photo_file_id') else 'нет'}. "
+            f"Фото: {seller_photo_count(row)} шт. "
             f"Контакт: {contact_text(row)}"
         )
         updates = {"city": row.get("city"), "budget": row.get("asking_price"), "message_text": text}
@@ -872,8 +930,8 @@ def close_request_owned(request_id: int, telegram_user_id: int, reason: str) -> 
 
 def offer_keyboard(match_id: int, side: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="✅ Да, интересно", callback_data=f"macc:{match_id}:{side}"),
-        InlineKeyboardButton(text="❌ Не интересно", callback_data=f"mdec:{match_id}:{side}"),
+        InlineKeyboardButton(text="✅ Интересно", callback_data=f"macc:{match_id}:{side}"),
+        InlineKeyboardButton(text="❌ Не подходит", callback_data=f"mdec:{match_id}:{side}"),
     ]])
 
 
@@ -883,25 +941,24 @@ async def send_match_offer(match: dict[str, Any], buyer: dict[str, Any], seller:
     seller_chat_id = int(seller["telegram_user_id"])
 
     buyer_text = (
-        f"🔗 <b>Найден подходящий автомобиль · совпадение {int(match.get('match_score') or 0)}%</b>\n\n"
-        f"🚙 <b>Автомобиль:</b> {esc(seller.get('vehicle'))}\n"
-        f"📍 <b>Город:</b> {esc(seller.get('city'))}\n"
-        f"📅 <b>Год:</b> {esc(seller.get('vehicle_year'))}\n"
-        f"💰 <b>Цена:</b> {esc(format_rub(seller.get('asking_price')))}\n"
-        f"🛣 <b>Пробег:</b> {esc(seller.get('mileage_km'))} км\n"
-        f"⚙️ <b>Комплектация:</b> {esc(seller.get('vehicle_trim') or 'не указана')}\n"
-        f"📝 <b>Описание:</b> {esc(str(seller.get('seller_description') or 'нет')[:300])}\n\n"
-        "Контакт продавца пока скрыт. Если предложение интересно, подтвердите — контакт откроется только после согласия обеих сторон."
+        f"🚘 <b>{esc(seller.get('vehicle'))} · {esc(seller.get('vehicle_year'))}</b>\n"
+        f"💰 <b>{esc(format_rub(seller.get('asking_price')))}</b>\n\n"
+        f"🎯 Совпадение с вашим запросом — <b>{int(match.get('match_score') or 0)}%</b>\n"
+        f"📍 {esc(seller.get('city'))}\n"
+        f"🛣 {esc(seller.get('mileage_km'))} км\n"
+        f"⚙️ {esc(seller.get('vehicle_trim') or 'Комплектация не указана')}\n"
+        f"📝 {esc(str(seller.get('seller_description') or 'Описание не добавлено')[:300])}\n\n"
+        "🔒 Контакт продавца скрыт. Нажмите «Интересно» — контакт откроется только после взаимного подтверждения."
     )
     seller_text = (
-        f"🔗 <b>Найден покупатель · совпадение {int(match.get('match_score') or 0)}%</b>\n\n"
-        f"🚗 <b>Ищет:</b> {esc(buyer.get('vehicle'))}\n"
-        f"📍 <b>Город:</b> {esc(buyer.get('city'))}\n"
-        f"📅 <b>Год:</b> {esc(buyer.get('min_vehicle_year'))}–{esc(buyer.get('max_vehicle_year'))}\n"
-        f"🛣 <b>Пробег:</b> до {esc(buyer.get('max_mileage_km'))} км\n"
-        f"💰 <b>Бюджет:</b> {esc(format_rub(buyer.get('budget')))}\n"
-        f"📝 <b>Требования:</b> {esc(buyer.get('requirements') or 'без дополнительных требований')}\n\n"
-        "Контакт покупателя пока скрыт. Если готовы продолжить, подтвердите — контакт откроется только после согласия обеих сторон."
+        f"👤 <b>Найден покупатель на {esc(buyer.get('vehicle'))}</b>\n\n"
+        f"🎯 Совпадение — <b>{int(match.get('match_score') or 0)}%</b>\n"
+        f"📍 {esc(buyer.get('city'))}\n"
+        f"📅 Год: {esc(buyer.get('min_vehicle_year'))}–{esc(buyer.get('max_vehicle_year'))}\n"
+        f"🛣 Пробег: до {esc(buyer.get('max_mileage_km'))} км\n"
+        f"💰 Бюджет: <b>{esc(format_rub(buyer.get('budget')))}</b>\n"
+        f"📝 {esc(buyer.get('requirements') or 'Без дополнительных требований')}\n\n"
+        "🔒 Контакт покупателя скрыт. Нажмите «Интересно» — контакт откроется только после взаимного подтверждения."
     )
 
     buyer_sent_at = match.get("buyer_offer_sent_at")
@@ -909,11 +966,23 @@ async def send_match_offer(match: dict[str, Any], buyer: dict[str, Any], seller:
 
     if not buyer_sent_at:
         try:
-            if seller.get("photo_file_id"):
+            photos = seller_photo_ids(seller)
+            if len(photos) == 1:
                 await bot.send_photo(
                     buyer_chat_id,
-                    photo=str(seller["photo_file_id"]),
+                    photo=photos[0],
                     caption=buyer_text,
+                    parse_mode="HTML",
+                    reply_markup=offer_keyboard(match_id, "buyer"),
+                )
+            elif len(photos) > 1:
+                await bot.send_media_group(
+                    buyer_chat_id,
+                    media=[InputMediaPhoto(media=photo_id) for photo_id in photos],
+                )
+                await bot.send_message(
+                    buyer_chat_id,
+                    buyer_text,
                     parse_mode="HTML",
                     reply_markup=offer_keyboard(match_id, "buyer"),
                 )
@@ -1101,7 +1170,7 @@ def save_seller_as_lead(request_row: dict[str, Any]) -> dict[str, Any]:
         f"Пробег: {mileage_text} км. "
         f"Комплектация: {request_row.get('vehicle_trim') or 'не указана'}. "
         f"Описание: {request_row.get('seller_description') or 'нет'}. "
-        f"Фото: {'есть' if request_row.get('photo_file_id') else 'нет'}. "
+        f"Фото: {seller_photo_count(request_row)} шт. "
         f"Контакт: {contact}"
     )
 
@@ -1133,7 +1202,8 @@ def save_seller_as_lead(request_row: dict[str, Any]) -> dict[str, Any]:
             "asking_price": price,
             "vehicle_trim": request_row.get("vehicle_trim"),
             "seller_description": request_row.get("seller_description"),
-            "has_photo": bool(request_row.get("photo_file_id")),
+            "has_photo": bool(seller_photo_count(request_row)),
+            "photo_count": seller_photo_count(request_row),
             "contact_phone": request_row.get("contact_phone"),
             "contact_telegram": request_row.get("contact_telegram"),
         },
@@ -1198,14 +1268,13 @@ def backfill_seller_radar_leads(limit: int = 50) -> None:
 @dp.message(CommandStart())
 async def start_handler(message: Message, state: FSMContext) -> None:
     await state.clear()
-    await message.answer(
-        "🚘 <b>Куплю авто | Продам авто</b>\n\n"
-        "Здесь можно бесплатно оставить заявку на покупку или продажу автомобиля.\n"
-        "Телефон не публикуется в открытом доступе — он используется только для связи по заявке.\n\n"
-        "Что вы хотите сделать?",
-        parse_mode="HTML",
-        reply_markup=MAIN_KB,
-    )
+    await message.answer(START_TEXT, parse_mode="HTML", reply_markup=MAIN_KB)
+
+
+@dp.message(Command("help"))
+async def help_handler(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    await message.answer(HELP_TEXT, parse_mode="HTML", reply_markup=MAIN_KB)
 
 
 @dp.message(Command("cancel"))
@@ -1214,6 +1283,7 @@ async def cancel_handler(message: Message, state: FSMContext) -> None:
     await message.answer("Действие отменено. Выберите, что хотите сделать:", reply_markup=MAIN_KB)
 
 
+@dp.message(Command("buy"))
 @dp.message(F.text == "🚗 Хочу купить авто")
 async def buyer_start(message: Message, state: FSMContext) -> None:
     await state.clear()
@@ -1368,6 +1438,7 @@ async def buyer_contact(message: Message, state: FSMContext) -> None:
     )
 
 
+@dp.message(Command("my"))
 @dp.message(Command("my"))
 @dp.message(F.text == "📋 Мои заявки")
 async def my_requests_handler(message: Message, state: FSMContext) -> None:
@@ -1525,9 +1596,13 @@ async def edit_request_value_handler(message: Message, state: FSMContext) -> Non
             photo = message.photo[-1]
             updates["photo_file_id"] = photo.file_id
             updates["photo_unique_id"] = photo.file_unique_id
+            updates["photo_file_ids"] = [photo.file_id]
+            updates["photo_unique_ids"] = [photo.file_unique_id]
         elif text.lower() in {"удалить", "удалить фото", "пропустить"}:
             updates["photo_file_id"] = None
             updates["photo_unique_id"] = None
+            updates["photo_file_ids"] = []
+            updates["photo_unique_ids"] = []
         else:
             await message.answer("Отправьте фотографию автомобиля или напишите «Удалить».")
             return
@@ -1603,6 +1678,7 @@ async def request_close_callback(callback: CallbackQuery, state: FSMContext) -> 
         await callback.message.answer(labels[reason], reply_markup=MAIN_KB)
 
 
+@dp.message(Command("sell"))
 @dp.message(F.text == "💰 Хочу продать авто")
 async def seller_start(message: Message, state: FSMContext) -> None:
     await state.clear()
@@ -1684,10 +1760,13 @@ async def seller_trim(message: Message, state: FSMContext) -> None:
 async def seller_description(message: Message, state: FSMContext) -> None:
     text = (message.text or "").strip()
     description = None if text == "Пропустить" else text[:1000]
-    await state.update_data(seller_description=description)
+    await state.update_data(seller_description=description, photo_file_ids=[], photo_unique_ids=[])
     await state.set_state(SellerForm.photo)
     await message.answer(
-        "📷 Отправьте главное фото автомобиля. Покупатель увидит его только после того, как AutoClick подтвердит совпадение.\nЕсли фото пока нет — нажмите «Пропустить».",
+        "📷 Добавьте до 5 фотографий автомобиля.\n\n"
+        "Лучше всего: спереди, сзади, салон, приборная панель и важные детали. "
+        "Отправляйте фото по одному. После первого фото появится кнопка «✅ Готово».\n\n"
+        "Если фото пока нет — нажмите «Пропустить».",
         reply_markup=SKIP_KB,
     )
 
@@ -1695,14 +1774,53 @@ async def seller_description(message: Message, state: FSMContext) -> None:
 @dp.message(SellerForm.photo)
 async def seller_photo(message: Message, state: FSMContext) -> None:
     text = (message.text or "").strip()
+    data = await state.get_data()
+    photo_ids = list(data.get("photo_file_ids") or [])
+    unique_ids = list(data.get("photo_unique_ids") or [])
+
     if message.photo:
         photo = message.photo[-1]
-        await state.update_data(photo_file_id=photo.file_id, photo_unique_id=photo.file_unique_id)
-    elif text == "Пропустить":
-        await state.update_data(photo_file_id=None, photo_unique_id=None)
-    else:
-        await message.answer("Отправьте фотографию автомобиля или нажмите «Пропустить».", reply_markup=SKIP_KB)
+        if photo.file_unique_id not in unique_ids:
+            photo_ids.append(photo.file_id)
+            unique_ids.append(photo.file_unique_id)
+        await state.update_data(photo_file_ids=photo_ids[:MAX_SELLER_PHOTOS], photo_unique_ids=unique_ids[:MAX_SELLER_PHOTOS])
+
+        count = min(len(photo_ids), MAX_SELLER_PHOTOS)
+        if count >= MAX_SELLER_PHOTOS:
+            await state.update_data(
+                photo_file_id=photo_ids[0],
+                photo_unique_id=unique_ids[0],
+            )
+            await state.set_state(SellerForm.contact)
+            await message.answer(
+                "✅ Добавлено 5 фото — отлично. Теперь укажите контакт для связи.",
+                reply_markup=CONTACT_KB,
+            )
+            return
+
+        await message.answer(
+            f"✅ Фото добавлено: {count}/{MAX_SELLER_PHOTOS}. Отправьте ещё или нажмите «✅ Готово».",
+            reply_markup=PHOTO_KB,
+        )
         return
+
+    if text == "✅ Готово":
+        if not photo_ids:
+            await message.answer("Сначала отправьте хотя бы одно фото или нажмите «Пропустить».", reply_markup=SKIP_KB)
+            return
+        await state.update_data(photo_file_id=photo_ids[0], photo_unique_id=unique_ids[0])
+    elif text == "Пропустить":
+        await state.update_data(
+            photo_file_id=None, photo_unique_id=None,
+            photo_file_ids=[], photo_unique_ids=[],
+        )
+    else:
+        await message.answer(
+            "Отправьте фотографию автомобиля. Можно добавить до 5 фото. Когда закончите — нажмите «✅ Готово».",
+            reply_markup=PHOTO_KB if photo_ids else SKIP_KB,
+        )
+        return
+
     await state.set_state(SellerForm.contact)
     await message.answer(
         "Как с вами связаться?\nМожно отправить номер телефона или оставить ваш Telegram.",
@@ -1739,6 +1857,8 @@ async def seller_contact(message: Message, state: FSMContext) -> None:
         "seller_description": data.get("seller_description"),
         "photo_file_id": data.get("photo_file_id"),
         "photo_unique_id": data.get("photo_unique_id"),
+        "photo_file_ids": data.get("photo_file_ids") or [],
+        "photo_unique_ids": data.get("photo_unique_ids") or [],
         "contact_phone": phone,
         "contact_telegram": telegram or ident["contact_telegram"],
         "status": "new",
@@ -1771,7 +1891,7 @@ async def seller_contact(message: Message, state: FSMContext) -> None:
     await state.clear()
     await message.answer(
         f"✅ Заявка #{row['id']} принята.\n\n"
-        "Данные автомобиля сохранены. Мы сможем сопоставлять его с запросами покупателей.",
+        "Автомобиль сохранён и участвует в подборе покупателей. Если найдётся подходящий запрос, вы получите предложение здесь.",
         reply_markup=MAIN_KB,
     )
 
@@ -1856,6 +1976,15 @@ async def fallback(message: Message) -> None:
 
 async def main() -> None:
     log.info("Starting public auto bot @%s", PUBLIC_BOT_USERNAME)
+    try:
+        await bot.set_my_commands(BOT_COMMANDS)
+        await bot.set_my_short_description("AutoClick — заявки на покупку и продажу авто. Совпадения по параметрам, контакты после взаимного интереса.")
+        await bot.set_my_description(
+            "AutoClick помогает покупателям и продавцам автомобилей находить друг друга по марке, бюджету, году и пробегу. "
+            "Оставьте заявку бесплатно. Контакты не публикуются и открываются только после взаимного подтверждения интереса."
+        )
+    except Exception:
+        log.exception("Could not update public bot profile/commands")
     await asyncio.to_thread(backfill_seller_radar_leads)
     await asyncio.to_thread(backfill_auto_matches)
     worker = asyncio.create_task(approved_match_worker())
