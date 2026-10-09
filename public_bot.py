@@ -690,6 +690,15 @@ def format_rub(value: Any) -> str:
         return str(value)
 
 
+def format_number(value: Any) -> str:
+    if value in (None, ""):
+        return "—"
+    try:
+        return f"{int(float(value)):,}".replace(",", " ")
+    except (TypeError, ValueError):
+        return str(value)
+
+
 ACTIVE_REQUEST_STATUSES = {"new", "in_progress"}
 
 
@@ -944,14 +953,16 @@ async def send_match_offer(match: dict[str, Any], buyer: dict[str, Any], seller:
     buyer_chat_id = int(buyer["telegram_user_id"])
     seller_chat_id = int(seller["telegram_user_id"])
 
+    description = str(seller.get("seller_description") or "").strip()
+    description_line = f"📝 {esc(description[:300])}\n" if description else ""
     buyer_text = (
         f"🚘 <b>{esc(seller.get('vehicle'))} · {esc(seller.get('vehicle_year'))}</b>\n"
         f"💰 <b>{esc(format_rub(seller.get('asking_price')))}</b>\n\n"
         f"🎯 Совпадение с вашим запросом — <b>{int(match.get('match_score') or 0)}%</b>\n"
         f"📍 {esc(seller.get('city'))}\n"
-        f"🛣 {esc(seller.get('mileage_km'))} км\n"
+        f"🛣 {esc(format_number(seller.get('mileage_km')))} км\n"
         f"⚙️ {esc(seller.get('vehicle_trim') or 'Комплектация не указана')}\n"
-        f"📝 {esc(str(seller.get('seller_description') or 'Описание не добавлено')[:300])}\n\n"
+        f"{description_line}\n"
         "🔒 Контакт продавца скрыт. Нажмите «Интересно» — контакт откроется только после взаимного подтверждения."
     )
     seller_text = (
@@ -959,7 +970,7 @@ async def send_match_offer(match: dict[str, Any], buyer: dict[str, Any], seller:
         f"🎯 Совпадение — <b>{int(match.get('match_score') or 0)}%</b>\n"
         f"📍 {esc(buyer.get('city'))}\n"
         f"📅 Год: {esc(buyer.get('min_vehicle_year'))}–{esc(buyer.get('max_vehicle_year'))}\n"
-        f"🛣 Пробег: до {esc(buyer.get('max_mileage_km'))} км\n"
+        f"🛣 Пробег: до {esc(format_number(buyer.get('max_mileage_km')))} км\n"
         f"💰 Бюджет: <b>{esc(format_rub(buyer.get('budget')))}</b>\n"
         f"📝 {esc(buyer.get('requirements') or 'Без дополнительных требований')}\n\n"
         "🔒 Контакт покупателя скрыт. Нажмите «Интересно» — контакт откроется только после взаимного подтверждения."
