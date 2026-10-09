@@ -184,6 +184,8 @@ def match_message(match: dict[str, Any], buyer: dict[str, Any], seller: dict[str
     reasons = match.get("match_reasons") or {}
     score = int(match.get("match_score") or 0)
     same_city = "да" if reasons.get("same_city") else "нет"
+    year_match = "да" if reasons.get("year_match") else "нет"
+    mileage_match = "да" if reasons.get("mileage_match") else "нет"
     budget = format_budget(buyer.get("budget"), "RUB")
     price = format_budget(seller.get("asking_price"), "RUB")
     return "\n".join([
@@ -192,6 +194,8 @@ def match_message(match: dict[str, Any], buyer: dict[str, Any], seller: dict[str
         "<b>🟢 ПОКУПАТЕЛЬ</b>",
         f"Авто: {esc(buyer.get('vehicle'))}",
         f"Город: {esc(buyer.get('city'))}",
+        f"Год: {esc(buyer.get('min_vehicle_year'))}–{esc(buyer.get('max_vehicle_year'))}",
+        f"Пробег: до {esc(buyer.get('max_mileage_km'))} км",
         f"Бюджет: {esc(budget)}",
         f"Требования: {esc(buyer.get('requirements') or 'без дополнительных требований')}",
         "",
@@ -202,10 +206,11 @@ def match_message(match: dict[str, Any], buyer: dict[str, Any], seller: dict[str
         f"Цена: {esc(price)}",
         f"Пробег: {esc(seller.get('mileage_km'))} км",
         "",
+        f"✅ Год подходит: {year_match}",
+        f"✅ Пробег подходит: {mileage_match}",
         f"Совпадает город: {same_city}",
         "Контакты сторонам пока не раскрываются.",
     ])
-
 
 def match_keyboard(match_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[[
