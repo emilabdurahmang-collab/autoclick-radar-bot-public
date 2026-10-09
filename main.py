@@ -298,13 +298,17 @@ def db_requeue_stale_matches() -> None:
     )
 
 
-def db_set_match_status(match_id: int, status: str) -> None:
-    (
+def db_set_match_status(match_id: int, status: str) -> bool:
+    rows = (
         supabase.table("auto_matches")
         .update({"status": status})
         .eq("id", match_id)
+        .eq("status", "new")
         .execute()
+        .data
+        or []
     )
+    return bool(rows)
 
 
 def keyboard_for(lead: dict[str, Any]) -> InlineKeyboardMarkup:
@@ -900,7 +904,12 @@ async def match_connect_callback(callback: CallbackQuery) -> None:
         await callback.answer("Нет доступа", show_alert=True)
         return
     match_id = int(callback.data.split(":", 1)[1])
-    await asyncio.to_thread(db_set_match_status, match_id, "approved")
+    changed = await asyncio.to_thread(db_set_match_status, match_id, "approved")
+    if not changed:
+        await callback.answer("Это совпадение уже закрыто или обработано", show_alert=True)
+        if callback.message:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        return
     await callback.answer("Обеим сторонам будет отправлено предложение")
     if callback.message:
         await callback.message.edit_reply_markup(reply_markup=None)
@@ -915,7 +924,12 @@ async def match_reject_callback(callback: CallbackQuery) -> None:
         await callback.answer("Нет доступа", show_alert=True)
         return
     match_id = int(callback.data.split(":", 1)[1])
-    await asyncio.to_thread(db_set_match_status, match_id, "rejected")
+    changed = await asyncio.to_thread(db_set_match_status, match_id, "rejected")
+    if not changed:
+        await callback.answer("Это совпадение уже закрыто или обработано", show_alert=True)
+        if callback.message:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        return
     await callback.answer("Совпадение отклонено")
     if callback.message:
         await callback.message.edit_reply_markup(reply_markup=None)
