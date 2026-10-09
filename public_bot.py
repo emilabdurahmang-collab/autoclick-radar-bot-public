@@ -1,7 +1,10 @@
 import asyncio
+import html
 import logging
 import os
 import re
+from datetime import datetime, timezone
+from difflib import SequenceMatcher
 from typing import Any
 
 from aiogram import Bot, Dispatcher, F
@@ -9,7 +12,15 @@ from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import KeyboardButton, Message, ReplyKeyboardMarkup, ReplyKeyboardRemove
+from aiogram.types import (
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    Message,
+    ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
+)
 from dotenv import load_dotenv
 from supabase import Client, create_client
 
@@ -133,13 +144,418 @@ def save_market_request(payload: dict[str, Any]) -> dict[str, Any]:
     return rows[0]
 
 
-def link_request_to_lead(request_id: int, lead_id: int) -> None:
-    (
+MATCH_THRESHOLD = 70
+
+VEHICLE_ALIASES = {
+    "бмв": "bmw",
+    "тойота": "toyota",
+    "мерседес": "mercedes",
+    "мерс": "mercedes",
+    "фольксваген": "volkswagen",
+    "фольцваген": "volkswagen",
+    "ауди": "audi",
+    "лексус": "lexus",
+    "хонда": "honda",
+    "мазда": "mazda",
+    "ниссан": "nissan",
+    "хендай": "hyundai",
+    "хундай": "hyundai",
+    "киа": "kia",
+    "шкода": "skoda",
+    "лада": "lada",
+    "хавал": "haval",
+    "джили": "geely",
+    "чери": "chery",
+    "омода": "omoda",
+    "зикр": "zeekr",
+    "камри": "camry",
+    "рав4": "rav4",
+    "рав": "rav4",
+    "икс5": "x5",
+    "икс3": "x3",
+    "икс6": "x6",
+}
+
+VEHICLE_NOISE = {
+    "авто", "автомобиль", "автомобиля", "машина", "машину", "продам", "куплю",
+    "ищу", "хочу", "год", "года", "г", "руб", "рублей",
+}
+
+
+def normalize_text(value: Any) -> str:
+    text = str(value or "").lower().replace("ё", "е")
+    text = re.sub(r"[^a-zа-я0-9]+", " ", text)
+    return " ".join(text.split())
+
+
+def esc(value: Any) -> str:
+    if value is None:
+        return "—"
+    return html.escape(str(value))
+
+
+def normalize_city(value: Any) -> str:
+    return normalize_text(value)
+
+
+def vehicle_tokens(value: Any) -> set[str]:
+    tokens: set[str] = set()
+    for token in normalize_text(value).split():
+        token = VEHICLE_ALIASES.get(token, token)
+        if token not in VEHICLE_NOISE and len(token) > 1:
+            tokens.add(token)
+    return tokens
+
+
+def vehicle_similarity(buyer_vehicle: Any, seller_vehicle: Any) -> float:
+    buyer_tokens = vehicle_tokens(buyer_vehicle)
+    seller_tokens = vehicle_tokens(seller_vehicle)
+    if not buyer_tokens or not seller_tokens:
+        return 0.0
+    if buyer_tokens <= seller_tokens or seller_tokens <= buyer_tokens:
+        return 1.0
+    overlap = len(buyer_tokens & seller_tokens) / len(buyer_tokens | seller_tokens)
+    left = " ".join(sorted(buyer_tokens))
+    right = " ".join(sorted(seller_tokens))
+    sequence = SequenceMatcher(None, left, right).ratio()
+    return max(overlap, sequence * 0.9)
+
+
+def evaluate_match(buyer: dict[str, Any], seller: dict[str, Any]) -> tuple[int, dict[str, Any]] | None:
+    similarity = vehicle_similarity(buyer.get("vehicle"), seller.get("vehicle"))
+    if similarity < 0.58:
+        return None
+
+    score = round(similarity * 60)
+    reasons: dict[str, Any] = {
+        "vehicle_similarity": round(similarity, 2),
+        "vehicle_match": similarity >= 0.82,
+    }
+
+    buyer_city = normalize_city(buyer.get("city"))
+    seller_city = normalize_city(seller.get("city"))
+    same_city = bool(buyer_city and seller_city and buyer_city == seller_city)
+    reasons["same_city"] = same_city
+    if same_city:
+        score += 15
+
+    budget = buyer.get("budget")
+    price = seller.get("asking_price")
+    if budget is not None and price is not None:
+        budget_value = float(budget)
+        price_value = float(price)
+        if budget_value <= 0:
+            return None
+        ratio = price_value / budget_value
+        reasons["price_to_budget"] = round(ratio, 3)
+        if ratio <= 1.0:
+            score += 25
+            reasons["within_budget"] = True
+        elif ratio <= 1.10:
+            score += 12
+            reasons["within_budget"] = False
+            reasons["slightly_over_budget"] = True
+        elif ratio <= 1.20:
+            score += 5
+            reasons["within_budget"] = False
+            reasons["over_budget"] = True
+        else:
+            return None
+    else:
+        reasons["within_budget"] = None
+
+    score = max(0, min(100, score))
+    if score < MATCH_THRESHOLD:
+        return None
+    return score, reasons
+
+
+def insert_match_if_new(buyer: dict[str, Any], seller: dict[str, Any]) -> dict[str, Any] | None:
+    buyer_id = int(buyer["id"])
+    seller_id = int(seller["id"])
+    existing = (
+        supabase.table("auto_matches")
+        .select("id,status")
+        .eq("buyer_request_id", buyer_id)
+        .eq("seller_request_id", seller_id)
+        .limit(1)
+        .execute()
+        .data
+        or []
+    )
+    if existing:
+        return existing[0]
+
+    evaluated = evaluate_match(buyer, seller)
+    if not evaluated:
+        return None
+    score, reasons = evaluated
+    rows = (
+        supabase.table("auto_matches")
+        .insert({
+            "buyer_request_id": buyer_id,
+            "seller_request_id": seller_id,
+            "match_score": score,
+            "match_reasons": reasons,
+            "status": "new",
+            "notification_status": "pending",
+        })
+        .execute()
+        .data
+        or []
+    )
+    if rows:
+        log.info("Auto match %s created: buyer=%s seller=%s score=%s", rows[0].get("id"), buyer_id, seller_id, score)
+        return rows[0]
+    return None
+
+
+def create_matches_for_request(request_row: dict[str, Any]) -> int:
+    request_type = request_row.get("request_type")
+    if request_type not in {"buyer", "seller"}:
+        return 0
+    opposite_type = "seller" if request_type == "buyer" else "buyer"
+    candidates = (
         supabase.table("market_requests")
-        .update({"radar_lead_id": lead_id})
+        .select("*")
+        .eq("request_type", opposite_type)
+        .in_("status", ["new", "in_progress"])
+        .order("created_at", desc=True)
+        .limit(200)
+        .execute()
+        .data
+        or []
+    )
+    created = 0
+    for candidate in candidates:
+        buyer = request_row if request_type == "buyer" else candidate
+        seller = candidate if request_type == "buyer" else request_row
+        if insert_match_if_new(buyer, seller):
+            created += 1
+    return created
+
+
+def backfill_auto_matches() -> None:
+    buyers = (
+        supabase.table("market_requests")
+        .select("*")
+        .eq("request_type", "buyer")
+        .in_("status", ["new", "in_progress"])
+        .order("created_at")
+        .limit(300)
+        .execute()
+        .data
+        or []
+    )
+    sellers = (
+        supabase.table("market_requests")
+        .select("*")
+        .eq("request_type", "seller")
+        .in_("status", ["new", "in_progress"])
+        .order("created_at")
+        .limit(300)
+        .execute()
+        .data
+        or []
+    )
+    for buyer in buyers:
+        for seller in sellers:
+            try:
+                insert_match_if_new(buyer, seller)
+            except Exception:
+                log.exception("Could not backfill match buyer=%s seller=%s", buyer.get("id"), seller.get("id"))
+
+
+def get_request(request_id: int) -> dict[str, Any] | None:
+    rows = (
+        supabase.table("market_requests")
+        .select("*")
         .eq("id", request_id)
+        .limit(1)
+        .execute()
+        .data
+        or []
+    )
+    return rows[0] if rows else None
+
+
+def get_match(match_id: int) -> dict[str, Any] | None:
+    rows = (
+        supabase.table("auto_matches")
+        .select("*")
+        .eq("id", match_id)
+        .limit(1)
+        .execute()
+        .data
+        or []
+    )
+    return rows[0] if rows else None
+
+
+def get_match_bundle(match_id: int) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]] | None:
+    match = get_match(match_id)
+    if not match:
+        return None
+    buyer = get_request(int(match["buyer_request_id"]))
+    seller = get_request(int(match["seller_request_id"]))
+    if not buyer or not seller:
+        return None
+    return match, buyer, seller
+
+
+def contact_text(request_row: dict[str, Any]) -> str:
+    return str(request_row.get("contact_phone") or request_row.get("contact_telegram") or "контакт не указан")
+
+
+def format_rub(value: Any) -> str:
+    if value in (None, ""):
+        return "—"
+    try:
+        return f"{int(float(value)):,} ₽".replace(",", " ")
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def offer_keyboard(match_id: int, side: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ Да, интересно", callback_data=f"macc:{match_id}:{side}"),
+        InlineKeyboardButton(text="❌ Не интересно", callback_data=f"mdec:{match_id}:{side}"),
+    ]])
+
+
+async def send_match_offer(match: dict[str, Any], buyer: dict[str, Any], seller: dict[str, Any]) -> None:
+    match_id = int(match["id"])
+    buyer_chat_id = int(buyer["telegram_user_id"])
+    seller_chat_id = int(seller["telegram_user_id"])
+
+    buyer_text = (
+        f"🔗 <b>Найден подходящий автомобиль · совпадение {int(match.get('match_score') or 0)}%</b>\n\n"
+        f"🚙 <b>Автомобиль:</b> {esc(seller.get('vehicle'))}\n"
+        f"📍 <b>Город:</b> {esc(seller.get('city'))}\n"
+        f"📅 <b>Год:</b> {esc(seller.get('vehicle_year'))}\n"
+        f"💰 <b>Цена:</b> {esc(format_rub(seller.get('asking_price')))}\n"
+        f"🛣 <b>Пробег:</b> {esc(seller.get('mileage_km'))} км\n\n"
+        "Контакт продавца пока скрыт. Если предложение интересно, подтвердите — контакт откроется только после согласия обеих сторон."
+    )
+    seller_text = (
+        f"🔗 <b>Найден покупатель · совпадение {int(match.get('match_score') or 0)}%</b>\n\n"
+        f"🚗 <b>Ищет:</b> {esc(buyer.get('vehicle'))}\n"
+        f"📍 <b>Город:</b> {esc(buyer.get('city'))}\n"
+        f"💰 <b>Бюджет:</b> {esc(format_rub(buyer.get('budget')))}\n"
+        f"📝 <b>Требования:</b> {esc(buyer.get('requirements') or 'без дополнительных требований')}\n\n"
+        "Контакт покупателя пока скрыт. Если готовы продолжить, подтвердите — контакт откроется только после согласия обеих сторон."
+    )
+
+    buyer_sent_at = match.get("buyer_offer_sent_at")
+    seller_sent_at = match.get("seller_offer_sent_at")
+
+    if not buyer_sent_at:
+        try:
+            await bot.send_message(
+                buyer_chat_id,
+                buyer_text,
+                parse_mode="HTML",
+                reply_markup=offer_keyboard(match_id, "buyer"),
+            )
+            buyer_sent_at = datetime.now(timezone.utc).isoformat()
+            await asyncio.to_thread(
+                lambda: supabase.table("auto_matches")
+                .update({"buyer_offer_sent_at": buyer_sent_at})
+                .eq("id", match_id)
+                .execute()
+            )
+        except Exception:
+            log.exception("Could not send match %s offer to buyer", match_id)
+
+    if not seller_sent_at:
+        try:
+            await bot.send_message(
+                seller_chat_id,
+                seller_text,
+                parse_mode="HTML",
+                reply_markup=offer_keyboard(match_id, "seller"),
+            )
+            seller_sent_at = datetime.now(timezone.utc).isoformat()
+            await asyncio.to_thread(
+                lambda: supabase.table("auto_matches")
+                .update({"seller_offer_sent_at": seller_sent_at})
+                .eq("id", match_id)
+                .execute()
+            )
+        except Exception:
+            log.exception("Could not send match %s offer to seller", match_id)
+
+    if buyer_sent_at and seller_sent_at:
+        (
+            supabase.table("auto_matches")
+            .update({"status": "offered", "offered_at": datetime.now(timezone.utc).isoformat()})
+            .eq("id", match_id)
+            .eq("status", "approved")
+            .execute()
+        )
+
+
+async def approved_match_worker() -> None:
+    while True:
+        try:
+            approved = (
+                supabase.table("auto_matches")
+                .select("*")
+                .eq("status", "approved")
+                .order("created_at")
+                .limit(20)
+                .execute()
+                .data
+                or []
+            )
+            for match in approved:
+                buyer = await asyncio.to_thread(get_request, int(match["buyer_request_id"]))
+                seller = await asyncio.to_thread(get_request, int(match["seller_request_id"]))
+                if buyer and seller:
+                    await send_match_offer(match, buyer, seller)
+        except Exception:
+            log.exception("Approved match worker error")
+        await asyncio.sleep(5)
+
+
+async def finalize_if_both_accepted(match_id: int) -> bool:
+    bundle = await asyncio.to_thread(get_match_bundle, match_id)
+    if not bundle:
+        return False
+    match, buyer, seller = bundle
+    if match.get("status") == "connected":
+        return True
+    if match.get("buyer_decision") != "accepted" or match.get("seller_decision") != "accepted":
+        return False
+
+    buyer_chat_id = int(buyer["telegram_user_id"])
+    seller_chat_id = int(seller["telegram_user_id"])
+    buyer_contact = esc(contact_text(buyer))
+    seller_contact = esc(contact_text(seller))
+
+    await bot.send_message(
+        buyer_chat_id,
+        "🤝 <b>Обе стороны подтвердили интерес.</b>\n\n"
+        f"Контакт продавца: <b>{seller_contact}</b>\n"
+        f"Автомобиль: {esc(seller.get('vehicle'))} · {esc(format_rub(seller.get('asking_price')))}",
+        parse_mode="HTML",
+    )
+    await bot.send_message(
+        seller_chat_id,
+        "🤝 <b>Обе стороны подтвердили интерес.</b>\n\n"
+        f"Контакт покупателя: <b>{buyer_contact}</b>\n"
+        f"Запрос: {esc(buyer.get('vehicle'))} · бюджет {esc(format_rub(buyer.get('budget')))}",
+        parse_mode="HTML",
+    )
+    (
+        supabase.table("auto_matches")
+        .update({"status": "connected", "connected_at": datetime.now(timezone.utc).isoformat()})
+        .eq("id", match_id)
+        .neq("status", "connected")
         .execute()
     )
+    return True
+
 
 
 def save_buyer_as_lead(request_row: dict[str, Any], message: Message) -> dict[str, Any] | None:
@@ -395,6 +811,10 @@ async def buyer_contact(message: Message, state: FSMContext) -> None:
         await message.answer("Не удалось сохранить заявку. Попробуйте ещё раз позже.", reply_markup=MAIN_KB)
         await state.clear()
         return
+    try:
+        await asyncio.to_thread(create_matches_for_request, row)
+    except Exception:
+        log.exception("Could not match buyer request %s", row.get("id"))
     await state.clear()
     await message.answer(
         f"✅ Заявка #{row['id']} принята.\n\n"
@@ -507,12 +927,89 @@ async def seller_contact(message: Message, state: FSMContext) -> None:
         await message.answer("Не удалось сохранить заявку. Попробуйте ещё раз позже.", reply_markup=MAIN_KB)
         await state.clear()
         return
+    try:
+        await asyncio.to_thread(create_matches_for_request, row)
+    except Exception:
+        log.exception("Could not match seller request %s", row.get("id"))
     await state.clear()
     await message.answer(
         f"✅ Заявка #{row['id']} принята.\n\n"
         "Данные автомобиля сохранены. Мы сможем сопоставлять его с запросами покупателей.",
         reply_markup=MAIN_KB,
     )
+
+
+@dp.callback_query(F.data.startswith("macc:"))
+async def match_accept_callback(callback: CallbackQuery) -> None:
+    try:
+        _, match_id_raw, side = callback.data.split(":", 2)
+        match_id = int(match_id_raw)
+    except Exception:
+        await callback.answer("Некорректная команда", show_alert=True)
+        return
+
+    bundle = await asyncio.to_thread(get_match_bundle, match_id)
+    if not bundle:
+        await callback.answer("Совпадение уже недоступно", show_alert=True)
+        return
+    match, buyer, seller = bundle
+    if match.get("status") not in {"approved", "offered"}:
+        await callback.answer("Это совпадение уже закрыто", show_alert=True)
+        return
+    request_row = buyer if side == "buyer" else seller
+    if not callback.from_user or int(request_row["telegram_user_id"]) != int(callback.from_user.id):
+        await callback.answer("Эта кнопка предназначена другой стороне", show_alert=True)
+        return
+
+    field = "buyer_decision" if side == "buyer" else "seller_decision"
+    await asyncio.to_thread(
+        lambda: supabase.table("auto_matches").update({field: "accepted"}).eq("id", match_id).execute()
+    )
+    await callback.answer("Интерес подтверждён")
+    if callback.message:
+        await callback.message.edit_reply_markup(reply_markup=None)
+        await callback.message.answer("✅ Ваш интерес подтверждён. Ждём подтверждение второй стороны.")
+    try:
+        connected = await finalize_if_both_accepted(match_id)
+        if connected and callback.message:
+            await callback.message.answer("🤝 Совпадение подтверждено обеими сторонами — контакты отправлены.")
+    except Exception:
+        log.exception("Could not finalize match %s", match_id)
+
+
+@dp.callback_query(F.data.startswith("mdec:"))
+async def match_decline_callback(callback: CallbackQuery) -> None:
+    try:
+        _, match_id_raw, side = callback.data.split(":", 2)
+        match_id = int(match_id_raw)
+    except Exception:
+        await callback.answer("Некорректная команда", show_alert=True)
+        return
+
+    bundle = await asyncio.to_thread(get_match_bundle, match_id)
+    if not bundle:
+        await callback.answer("Совпадение уже недоступно", show_alert=True)
+        return
+    match, buyer, seller = bundle
+    if match.get("status") not in {"approved", "offered"}:
+        await callback.answer("Это совпадение уже закрыто", show_alert=True)
+        return
+    request_row = buyer if side == "buyer" else seller
+    if not callback.from_user or int(request_row["telegram_user_id"]) != int(callback.from_user.id):
+        await callback.answer("Эта кнопка предназначена другой стороне", show_alert=True)
+        return
+
+    field = "buyer_decision" if side == "buyer" else "seller_decision"
+    await asyncio.to_thread(
+        lambda: supabase.table("auto_matches")
+        .update({field: "declined", "status": "rejected"})
+        .eq("id", match_id)
+        .execute()
+    )
+    await callback.answer("Отказ сохранён")
+    if callback.message:
+        await callback.message.edit_reply_markup(reply_markup=None)
+        await callback.message.answer("Понятно. Это совпадение закрыто, заявка остаётся активной для других вариантов.")
 
 
 @dp.message()
@@ -523,7 +1020,13 @@ async def fallback(message: Message) -> None:
 async def main() -> None:
     log.info("Starting public auto bot @%s", PUBLIC_BOT_USERNAME)
     await asyncio.to_thread(backfill_seller_radar_leads)
-    await dp.start_polling(bot)
+    await asyncio.to_thread(backfill_auto_matches)
+    worker = asyncio.create_task(approved_match_worker())
+    try:
+        await dp.start_polling(bot)
+    finally:
+        worker.cancel()
+        await bot.session.close()
 
 
 if __name__ == "__main__":
