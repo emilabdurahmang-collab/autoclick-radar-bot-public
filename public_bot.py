@@ -70,10 +70,15 @@ class SellerForm(StatesGroup):
     contact = State()
 
 
+class EditRequestForm(StatesGroup):
+    value = State()
+
+
 MAIN_KB = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="🚗 Хочу купить авто")],
         [KeyboardButton(text="💰 Хочу продать авто")],
+        [KeyboardButton(text="📋 Мои заявки")],
     ],
     resize_keyboard=True,
 )
@@ -418,7 +423,7 @@ def insert_match_if_new(buyer: dict[str, Any], seller: dict[str, Any]) -> dict[s
     seller_id = int(seller["id"])
     existing = (
         supabase.table("auto_matches")
-        .select("id,status")
+        .select("*")
         .eq("buyer_request_id", buyer_id)
         .eq("seller_request_id", seller_id)
         .limit(1)
@@ -426,13 +431,47 @@ def insert_match_if_new(buyer: dict[str, Any], seller: dict[str, Any]) -> dict[s
         .data
         or []
     )
-    if existing:
+
+    if existing and existing[0].get("status") != "expired":
         return existing[0]
 
     evaluated = evaluate_match(buyer, seller)
     if not evaluated:
         return None
     score, reasons = evaluated
+
+    # If this pair existed before but became stale because a request was edited,
+    # reuse the same row instead of creating a duplicate pair.
+    if existing:
+        match_id = int(existing[0]["id"])
+        rows = (
+            supabase.table("auto_matches")
+            .update({
+                "match_score": score,
+                "match_reasons": reasons,
+                "status": "new",
+                "buyer_decision": "pending",
+                "seller_decision": "pending",
+                "notification_status": "pending",
+                "notification_claimed_at": None,
+                "notified_at": None,
+                "notification_error": None,
+                "offered_at": None,
+                "buyer_offer_sent_at": None,
+                "seller_offer_sent_at": None,
+                "connected_at": None,
+            })
+            .eq("id", match_id)
+            .eq("status", "expired")
+            .execute()
+            .data
+            or []
+        )
+        if rows:
+            log.info("Auto match %s refreshed after request edit: buyer=%s seller=%s score=%s", match_id, buyer_id, seller_id, score)
+            return rows[0]
+        return None
+
     rows = (
         supabase.table("auto_matches")
         .insert({
@@ -584,6 +623,236 @@ def format_rub(value: Any) -> str:
         return f"{int(float(value)):,} ₽".replace(",", " ")
     except (TypeError, ValueError):
         return str(value)
+
+
+ACTIVE_REQUEST_STATUSES = {"new", "in_progress"}
+
+
+def get_user_requests(telegram_user_id: int, limit: int = 12) -> list[dict[str, Any]]:
+    return (
+        supabase.table("market_requests")
+        .select("*")
+        .eq("telegram_user_id", telegram_user_id)
+        .order("created_at", desc=True)
+        .limit(limit)
+        .execute()
+        .data
+        or []
+    )
+
+
+def request_status_text(row: dict[str, Any]) -> str:
+    reason = row.get("close_reason")
+    if reason == "bought":
+        return "✅ Купил автомобиль"
+    if reason == "sold":
+        return "✅ Автомобиль продан"
+    if reason == "cancelled":
+        return "⛔ Закрыта"
+    return {
+        "new": "🟢 Активна",
+        "in_progress": "🟡 В работе",
+        "done": "✅ Закрыта",
+        "rejected": "⛔ Закрыта",
+    }.get(str(row.get("status") or ""), str(row.get("status") or "—"))
+
+
+def request_card(row: dict[str, Any]) -> str:
+    request_id = int(row["id"])
+    is_buyer = row.get("request_type") == "buyer"
+    body = [
+        f"<b>{'🟢 ПОКУПКА' if is_buyer else '🔵 ПРОДАЖА'} · заявка #{request_id}</b>",
+        f"Статус: {request_status_text(row)}",
+        "",
+        f"🚙 Авто: {esc(row.get('vehicle'))}",
+        f"📍 Город: {esc(row.get('city'))}",
+    ]
+    if is_buyer:
+        body.extend([
+            f"💰 Бюджет: {esc(format_rub(row.get('budget')))}",
+            f"📅 Год: {esc(row.get('min_vehicle_year'))}–{esc(row.get('max_vehicle_year'))}",
+            f"🛣 Максимальный пробег: {esc(row.get('max_mileage_km'))} км",
+            f"📝 Требования: {esc(row.get('requirements') or 'нет')}",
+        ])
+    else:
+        body.extend([
+            f"📅 Год: {esc(row.get('vehicle_year'))}",
+            f"💰 Цена: {esc(format_rub(row.get('asking_price')))}",
+            f"🛣 Пробег: {esc(row.get('mileage_km'))} км",
+        ])
+    return "\n".join(body)
+
+
+def request_actions_keyboard(row: dict[str, Any]) -> InlineKeyboardMarkup | None:
+    if row.get("status") not in ACTIVE_REQUEST_STATUSES:
+        return None
+    request_id = int(row["id"])
+    success_reason = "bought" if row.get("request_type") == "buyer" else "sold"
+    success_text = "✅ Купил авто" if success_reason == "bought" else "✅ Продано"
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✏️ Изменить", callback_data=f"reqedit:{request_id}")],
+        [InlineKeyboardButton(text=success_text, callback_data=f"reqclose:{request_id}:{success_reason}")],
+        [InlineKeyboardButton(text="🛑 Закрыть заявку", callback_data=f"reqclose:{request_id}:cancelled")],
+    ])
+
+
+def edit_fields_keyboard(row: dict[str, Any]) -> InlineKeyboardMarkup:
+    request_id = int(row["id"])
+    if row.get("request_type") == "buyer":
+        fields = [
+            ("📍 Город", "city"), ("🚙 Авто", "vehicle"),
+            ("💰 Бюджет", "budget"), ("📅 Мин. год", "min_vehicle_year"),
+            ("📅 Макс. год", "max_vehicle_year"), ("🛣 Пробег до", "max_mileage_km"),
+            ("📝 Требования", "requirements"), ("☎️ Контакт", "contact"),
+        ]
+    else:
+        fields = [
+            ("📍 Город", "city"), ("🚙 Авто", "vehicle"),
+            ("📅 Год", "vehicle_year"), ("💰 Цена", "asking_price"),
+            ("🛣 Пробег", "mileage_km"), ("☎️ Контакт", "contact"),
+        ]
+    rows: list[list[InlineKeyboardButton]] = []
+    for i in range(0, len(fields), 2):
+        rows.append([
+            InlineKeyboardButton(text=label, callback_data=f"reqfield:{request_id}:{field}")
+            for label, field in fields[i:i + 2]
+        ])
+    rows.append([InlineKeyboardButton(text="⬅️ Назад к заявке", callback_data=f"reqshow:{request_id}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def edit_field_prompt(field: str) -> str:
+    prompts = {
+        "city": "Введите новый город.",
+        "vehicle": "Введите новую марку и модель автомобиля.",
+        "budget": "Введите новый бюджет, например 2,5 млн или 2 500 000 ₽.",
+        "min_vehicle_year": "Введите новый минимальный год, например 2020.",
+        "max_vehicle_year": "Введите новый максимальный год, например 2026.",
+        "max_mileage_km": "Введите новый максимальный пробег, например 100000.",
+        "requirements": "Введите новые требования. Если требований нет — напишите «Пропустить».",
+        "vehicle_year": "Введите новый год автомобиля, например 2020.",
+        "asking_price": "Введите новую цену, например 2,5 млн или 2 500 000 ₽.",
+        "mileage_km": "Введите новый пробег автомобиля, например 85000.",
+        "contact": "Отправьте новый телефон или @username.",
+    }
+    return prompts.get(field, "Введите новое значение.")
+
+
+def expire_matches_for_request(request_id: int) -> None:
+    (
+        supabase.table("auto_matches")
+        .update({"status": "expired"})
+        .in_("status", ["new", "approved", "offered"])
+        .or_(f"buyer_request_id.eq.{request_id},seller_request_id.eq.{request_id}")
+        .execute()
+    )
+
+
+def sync_request_lead(row: dict[str, Any]) -> None:
+    lead_id = row.get("radar_lead_id")
+    if not lead_id:
+        return
+    if row.get("request_type") == "buyer":
+        text = (
+            f"🟢 ПОКУПАТЕЛЬ | Куплю авто: {row.get('vehicle')}. "
+            f"Город: {row.get('city')}. Бюджет до {format_rub(row.get('budget'))}. "
+            f"Год: {row.get('min_vehicle_year')}–{row.get('max_vehicle_year')}. "
+            f"Пробег до {row.get('max_mileage_km')} км. "
+            f"Требования: {row.get('requirements') or 'без дополнительных требований'}. "
+            f"Контакт: {contact_text(row)}"
+        )
+        updates = {"city": row.get("city"), "budget": row.get("budget"), "message_text": text}
+    else:
+        text = (
+            f"🔵 ПРОДАВЕЦ | Продам авто: {row.get('vehicle')}. "
+            f"Город: {row.get('city')}. Год: {row.get('vehicle_year')}. "
+            f"Цена: {format_rub(row.get('asking_price'))}. "
+            f"Пробег: {row.get('mileage_km')} км. Контакт: {contact_text(row)}"
+        )
+        updates = {"city": row.get("city"), "budget": row.get("asking_price"), "message_text": text}
+    supabase.table("leads").update(updates).eq("id", int(lead_id)).execute()
+
+
+def update_request_owned(request_id: int, telegram_user_id: int, updates: dict[str, Any]) -> tuple[str, dict[str, Any] | None]:
+    row = get_request(request_id)
+    if not row or int(row.get("telegram_user_id") or 0) != telegram_user_id:
+        return "not_found", None
+    if row.get("status") not in ACTIVE_REQUEST_STATUSES:
+        return "closed", row
+
+    merged = dict(row)
+    merged.update(updates)
+    fingerprint = request_fingerprint(merged)
+    duplicate = (
+        supabase.table("market_requests")
+        .select("id")
+        .eq("telegram_user_id", telegram_user_id)
+        .eq("request_type", row.get("request_type"))
+        .eq("request_fingerprint", fingerprint)
+        .in_("status", ["new", "in_progress"])
+        .neq("id", request_id)
+        .limit(1)
+        .execute()
+        .data
+        or []
+    )
+    if duplicate:
+        return "duplicate", {"id": duplicate[0]["id"]}
+
+    payload = dict(updates)
+    payload["request_fingerprint"] = fingerprint
+    rows = (
+        supabase.table("market_requests")
+        .update(payload)
+        .eq("id", request_id)
+        .eq("telegram_user_id", telegram_user_id)
+        .in_("status", ["new", "in_progress"])
+        .execute()
+        .data
+        or []
+    )
+    if not rows:
+        return "not_found", None
+    updated = rows[0]
+    expire_matches_for_request(request_id)
+    sync_request_lead(updated)
+    create_matches_for_request(updated)
+    return "ok", updated
+
+
+def close_request_owned(request_id: int, telegram_user_id: int, reason: str) -> tuple[str, dict[str, Any] | None]:
+    row = get_request(request_id)
+    if not row or int(row.get("telegram_user_id") or 0) != telegram_user_id:
+        return "not_found", None
+    if row.get("status") not in ACTIVE_REQUEST_STATUSES:
+        return "closed", row
+    if reason == "bought" and row.get("request_type") != "buyer":
+        return "not_found", None
+    if reason == "sold" and row.get("request_type") != "seller":
+        return "not_found", None
+    if reason not in {"bought", "sold", "cancelled"}:
+        return "not_found", None
+
+    status = "done" if reason in {"bought", "sold"} else "rejected"
+    now = datetime.now(timezone.utc).isoformat()
+    rows = (
+        supabase.table("market_requests")
+        .update({"status": status, "close_reason": reason, "closed_at": now})
+        .eq("id", request_id)
+        .eq("telegram_user_id", telegram_user_id)
+        .in_("status", ["new", "in_progress"])
+        .execute()
+        .data
+        or []
+    )
+    if not rows:
+        return "closed", row
+    updated = rows[0]
+    expire_matches_for_request(request_id)
+    if updated.get("radar_lead_id"):
+        lead_status = "done" if status == "done" else "rejected"
+        supabase.table("leads").update({"status": lead_status}).eq("id", int(updated["radar_lead_id"])).execute()
+    return "ok", updated
 
 
 def offer_keyboard(match_id: int, side: str) -> InlineKeyboardMarkup:
@@ -1065,6 +1334,221 @@ async def buyer_contact(message: Message, state: FSMContext) -> None:
         "Мы зафиксировали, какой автомобиль вы ищете. Когда появится подходящий вариант, с вами можно будет связаться по указанному контакту.",
         reply_markup=MAIN_KB,
     )
+
+
+@dp.message(Command("my"))
+@dp.message(F.text == "📋 Мои заявки")
+async def my_requests_handler(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    if not message.from_user:
+        return
+    rows = await asyncio.to_thread(get_user_requests, int(message.from_user.id))
+    if not rows:
+        await message.answer("У вас пока нет заявок.", reply_markup=MAIN_KB)
+        return
+    await message.answer("📋 <b>Ваши последние заявки</b>", parse_mode="HTML", reply_markup=MAIN_KB)
+    for row in rows:
+        await message.answer(
+            request_card(row),
+            parse_mode="HTML",
+            reply_markup=request_actions_keyboard(row),
+        )
+
+
+@dp.callback_query(F.data.startswith("reqshow:"))
+async def request_show_callback(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    if not callback.from_user:
+        return
+    try:
+        request_id = int(callback.data.split(":", 1)[1])
+    except Exception:
+        await callback.answer("Некорректная заявка", show_alert=True)
+        return
+    row = await asyncio.to_thread(get_request, request_id)
+    if not row or int(row.get("telegram_user_id") or 0) != int(callback.from_user.id):
+        await callback.answer("Заявка не найдена", show_alert=True)
+        return
+    await callback.answer()
+    if callback.message:
+        await callback.message.edit_text(
+            request_card(row),
+            parse_mode="HTML",
+            reply_markup=request_actions_keyboard(row),
+        )
+
+
+@dp.callback_query(F.data.startswith("reqedit:"))
+async def request_edit_callback(callback: CallbackQuery, state: FSMContext) -> None:
+    if not callback.from_user:
+        return
+    try:
+        request_id = int(callback.data.split(":", 1)[1])
+    except Exception:
+        await callback.answer("Некорректная заявка", show_alert=True)
+        return
+    row = await asyncio.to_thread(get_request, request_id)
+    if not row or int(row.get("telegram_user_id") or 0) != int(callback.from_user.id):
+        await callback.answer("Заявка не найдена", show_alert=True)
+        return
+    if row.get("status") not in ACTIVE_REQUEST_STATUSES:
+        await callback.answer("Закрытую заявку изменить нельзя", show_alert=True)
+        return
+    await state.clear()
+    await callback.answer("Выберите поле")
+    if callback.message:
+        await callback.message.edit_reply_markup(reply_markup=edit_fields_keyboard(row))
+
+
+@dp.callback_query(F.data.startswith("reqfield:"))
+async def request_field_callback(callback: CallbackQuery, state: FSMContext) -> None:
+    if not callback.from_user:
+        return
+    try:
+        _, request_id_raw, field = callback.data.split(":", 2)
+        request_id = int(request_id_raw)
+    except Exception:
+        await callback.answer("Некорректная команда", show_alert=True)
+        return
+    row = await asyncio.to_thread(get_request, request_id)
+    if not row or int(row.get("telegram_user_id") or 0) != int(callback.from_user.id):
+        await callback.answer("Заявка не найдена", show_alert=True)
+        return
+    if row.get("status") not in ACTIVE_REQUEST_STATUSES:
+        await callback.answer("Закрытую заявку изменить нельзя", show_alert=True)
+        return
+
+    buyer_fields = {"city", "vehicle", "budget", "min_vehicle_year", "max_vehicle_year", "max_mileage_km", "requirements", "contact"}
+    seller_fields = {"city", "vehicle", "vehicle_year", "asking_price", "mileage_km", "contact"}
+    allowed = buyer_fields if row.get("request_type") == "buyer" else seller_fields
+    if field not in allowed:
+        await callback.answer("Это поле недоступно", show_alert=True)
+        return
+
+    await state.set_state(EditRequestForm.value)
+    await state.update_data(edit_request_id=request_id, edit_field=field)
+    await callback.answer()
+    if callback.message:
+        reply_markup = CONTACT_KB if field == "contact" else ReplyKeyboardRemove()
+        await callback.message.answer(edit_field_prompt(field), reply_markup=reply_markup)
+
+
+@dp.message(EditRequestForm.value)
+async def edit_request_value_handler(message: Message, state: FSMContext) -> None:
+    if not message.from_user:
+        return
+    data = await state.get_data()
+    request_id = int(data.get("edit_request_id") or 0)
+    field = str(data.get("edit_field") or "")
+    row = await asyncio.to_thread(get_request, request_id)
+    if not row or int(row.get("telegram_user_id") or 0) != int(message.from_user.id):
+        await state.clear()
+        await message.answer("Заявка не найдена.", reply_markup=MAIN_KB)
+        return
+
+    text = (message.text or "").strip()
+    updates: dict[str, Any] = {}
+    if field in {"city", "vehicle"}:
+        if len(text) < 2:
+            await message.answer("Слишком короткое значение. Попробуйте ещё раз.")
+            return
+        updates[field] = text[:200 if field == "vehicle" else 120]
+    elif field in {"budget", "asking_price"}:
+        value = parse_money(text)
+        if value is None:
+            await message.answer("Не понял сумму. Например: 2,5 млн или 2 500 000 ₽.")
+            return
+        updates[field] = value
+    elif field in {"min_vehicle_year", "max_vehicle_year", "vehicle_year"}:
+        value = parse_int(text)
+        if value is None or value < 1950 or value > 2035:
+            await message.answer("Введите год четырьмя цифрами, например 2020.")
+            return
+        if field == "min_vehicle_year" and row.get("max_vehicle_year") is not None and value > int(row["max_vehicle_year"]):
+            await message.answer(f"Минимальный год не может быть больше {row['max_vehicle_year']}.")
+            return
+        if field == "max_vehicle_year" and row.get("min_vehicle_year") is not None and value < int(row["min_vehicle_year"]):
+            await message.answer(f"Максимальный год не может быть меньше {row['min_vehicle_year']}.")
+            return
+        updates[field] = value
+    elif field in {"max_mileage_km", "mileage_km"}:
+        value = parse_int(text)
+        if value is None or value < 0 or value > 2_000_000:
+            await message.answer("Введите пробег цифрами, например 100000.")
+            return
+        updates[field] = value
+    elif field == "requirements":
+        updates[field] = None if text.lower() == "пропустить" else text[:500]
+    elif field == "contact":
+        phone, telegram = contact_from_message(message)
+        if not phone and not telegram:
+            await message.answer("Отправьте номер телефона или @username.", reply_markup=CONTACT_KB)
+            return
+        if phone:
+            updates["contact_phone"] = phone
+            updates["contact_telegram"] = None
+        if telegram:
+            updates["contact_telegram"] = telegram
+            updates["contact_phone"] = None
+    else:
+        await state.clear()
+        await message.answer("Не удалось определить поле для изменения.", reply_markup=MAIN_KB)
+        return
+
+    try:
+        result, updated = await asyncio.to_thread(update_request_owned, request_id, int(message.from_user.id), updates)
+    except Exception:
+        log.exception("Failed to edit market request %s", request_id)
+        await message.answer("Не удалось изменить заявку. Попробуйте ещё раз позже.", reply_markup=MAIN_KB)
+        await state.clear()
+        return
+
+    if result == "duplicate":
+        await message.answer(
+            f"ℹ️ После этого изменения заявка станет копией активной заявки №{updated['id']}. Изменение не сохранено.",
+            reply_markup=MAIN_KB,
+        )
+        await state.clear()
+        return
+    if result != "ok" or not updated:
+        await message.answer("Эту заявку уже нельзя изменить.", reply_markup=MAIN_KB)
+        await state.clear()
+        return
+
+    await state.clear()
+    await message.answer("✅ Заявка обновлена. Совпадения пересчитаны.", reply_markup=MAIN_KB)
+    await message.answer(request_card(updated), parse_mode="HTML", reply_markup=request_actions_keyboard(updated))
+
+
+@dp.callback_query(F.data.startswith("reqclose:"))
+async def request_close_callback(callback: CallbackQuery, state: FSMContext) -> None:
+    if not callback.from_user:
+        return
+    try:
+        _, request_id_raw, reason = callback.data.split(":", 2)
+        request_id = int(request_id_raw)
+    except Exception:
+        await callback.answer("Некорректная команда", show_alert=True)
+        return
+    try:
+        result, row = await asyncio.to_thread(close_request_owned, request_id, int(callback.from_user.id), reason)
+    except Exception:
+        log.exception("Failed to close market request %s", request_id)
+        await callback.answer("Не удалось закрыть заявку", show_alert=True)
+        return
+    if result == "not_found":
+        await callback.answer("Заявка не найдена", show_alert=True)
+        return
+    if result == "closed":
+        await callback.answer("Заявка уже закрыта", show_alert=True)
+        return
+
+    await state.clear()
+    labels = {"bought": "✅ Отмечено: автомобиль куплен.", "sold": "✅ Отмечено: автомобиль продан.", "cancelled": "🛑 Заявка закрыта."}
+    await callback.answer("Готово")
+    if callback.message and row:
+        await callback.message.edit_text(request_card(row), parse_mode="HTML", reply_markup=None)
+        await callback.message.answer(labels[reason], reply_markup=MAIN_KB)
 
 
 @dp.message(F.text == "💰 Хочу продать авто")
