@@ -180,6 +180,128 @@ def lead_message(lead: dict[str, Any]) -> str:
     return "\n".join(body)
 
 
+def match_message(match: dict[str, Any], buyer: dict[str, Any], seller: dict[str, Any]) -> str:
+    reasons = match.get("match_reasons") or {}
+    score = int(match.get("match_score") or 0)
+    same_city = "да" if reasons.get("same_city") else "нет"
+    budget = format_budget(buyer.get("budget"), "RUB")
+    price = format_budget(seller.get("asking_price"), "RUB")
+    return "\n".join([
+        f"<b>🔗 СОВПАДЕНИЕ · {score}%</b>",
+        "",
+        "<b>🟢 ПОКУПАТЕЛЬ</b>",
+        f"Авто: {esc(buyer.get('vehicle'))}",
+        f"Город: {esc(buyer.get('city'))}",
+        f"Бюджет: {esc(budget)}",
+        f"Требования: {esc(buyer.get('requirements') or 'без дополнительных требований')}",
+        "",
+        "<b>🔵 ПРОДАВЕЦ</b>",
+        f"Авто: {esc(seller.get('vehicle'))}",
+        f"Город: {esc(seller.get('city'))}",
+        f"Год: {esc(seller.get('vehicle_year'))}",
+        f"Цена: {esc(price)}",
+        f"Пробег: {esc(seller.get('mileage_km'))} км",
+        "",
+        f"Совпадает город: {same_city}",
+        "Контакты сторонам пока не раскрываются.",
+    ])
+
+
+def match_keyboard(match_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ Соединить", callback_data=f"matchconnect:{match_id}"),
+        InlineKeyboardButton(text="❌ Не подходит", callback_data=f"matchreject:{match_id}"),
+    ]])
+
+
+def db_get_market_request(request_id: int) -> dict[str, Any] | None:
+    rows = (
+        supabase.table("market_requests")
+        .select("*")
+        .eq("id", request_id)
+        .limit(1)
+        .execute()
+        .data
+        or []
+    )
+    return rows[0] if rows else None
+
+
+def db_get_pending_matches() -> list[dict[str, Any]]:
+    return (
+        supabase.table("auto_matches")
+        .select("*")
+        .eq("status", "new")
+        .eq("notification_status", "pending")
+        .order("created_at")
+        .limit(10)
+        .execute()
+        .data
+        or []
+    )
+
+
+def db_claim_match(match_id: int) -> bool:
+    rows = (
+        supabase.table("auto_matches")
+        .update({
+            "notification_status": "sending",
+            "notification_claimed_at": datetime.now(timezone.utc).isoformat(),
+            "notification_error": None,
+        })
+        .eq("id", match_id)
+        .eq("notification_status", "pending")
+        .eq("status", "new")
+        .execute()
+        .data
+        or []
+    )
+    return bool(rows)
+
+
+def db_mark_match_sent(match_id: int) -> None:
+    (
+        supabase.table("auto_matches")
+        .update({
+            "notification_status": "sent",
+            "notified_at": datetime.now(timezone.utc).isoformat(),
+            "notification_error": None,
+        })
+        .eq("id", match_id)
+        .execute()
+    )
+
+
+def db_mark_match_failed(match_id: int, error: str) -> None:
+    (
+        supabase.table("auto_matches")
+        .update({"notification_status": "failed", "notification_error": error[:1000]})
+        .eq("id", match_id)
+        .execute()
+    )
+
+
+def db_requeue_stale_matches() -> None:
+    cutoff = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()
+    (
+        supabase.table("auto_matches")
+        .update({"notification_status": "pending", "notification_claimed_at": None})
+        .eq("notification_status", "sending")
+        .eq("status", "new")
+        .lt("notification_claimed_at", cutoff)
+        .execute()
+    )
+
+
+def db_set_match_status(match_id: int, status: str) -> None:
+    (
+        supabase.table("auto_matches")
+        .update({"status": status})
+        .eq("id", match_id)
+        .execute()
+    )
+
+
 def keyboard_for(lead: dict[str, Any]) -> InlineKeyboardMarkup:
     lead_id = lead["id"]
     rows = [[
@@ -767,6 +889,34 @@ async def group_message_handler(message: Message) -> None:
         log.exception("Failed to process group message %s/%s", message.chat.id, message.message_id)
 
 
+@dp.callback_query(F.data.startswith("matchconnect:"))
+async def match_connect_callback(callback: CallbackQuery) -> None:
+    if ADMIN_CHAT_ID is not None and callback.message and callback.message.chat.id != ADMIN_CHAT_ID:
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    match_id = int(callback.data.split(":", 1)[1])
+    await asyncio.to_thread(db_set_match_status, match_id, "approved")
+    await callback.answer("Обеим сторонам будет отправлено предложение")
+    if callback.message:
+        await callback.message.edit_reply_markup(reply_markup=None)
+        await callback.message.answer(
+            f"✅ Совпадение #{match_id} одобрено. AutoClick отправит предложение покупателю и продавцу; контакты откроются только после взаимного согласия."
+        )
+
+
+@dp.callback_query(F.data.startswith("matchreject:"))
+async def match_reject_callback(callback: CallbackQuery) -> None:
+    if ADMIN_CHAT_ID is not None and callback.message and callback.message.chat.id != ADMIN_CHAT_ID:
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    match_id = int(callback.data.split(":", 1)[1])
+    await asyncio.to_thread(db_set_match_status, match_id, "rejected")
+    await callback.answer("Совпадение отклонено")
+    if callback.message:
+        await callback.message.edit_reply_markup(reply_markup=None)
+        await callback.message.answer(f"❌ Совпадение #{match_id} отклонено. Обе исходные заявки остаются в базе.")
+
+
 @dp.callback_query(F.data.startswith("work:"))
 async def work_callback(callback: CallbackQuery) -> None:
     if ADMIN_CHAT_ID is not None and callback.message and callback.message.chat.id != ADMIN_CHAT_ID:
@@ -824,6 +974,31 @@ async def notification_worker() -> None:
                 except Exception as exc:
                     log.exception("Failed to send lead %s", lead_id)
                     await asyncio.to_thread(db_mark_failed, lead_id, str(exc))
+
+            await asyncio.to_thread(db_requeue_stale_matches)
+            matches = await asyncio.to_thread(db_get_pending_matches)
+            for match in matches:
+                match_id = int(match["id"])
+                claimed = await asyncio.to_thread(db_claim_match, match_id)
+                if not claimed:
+                    continue
+                try:
+                    buyer = await asyncio.to_thread(db_get_market_request, int(match["buyer_request_id"]))
+                    seller = await asyncio.to_thread(db_get_market_request, int(match["seller_request_id"]))
+                    if not buyer or not seller:
+                        raise RuntimeError("buyer or seller request missing")
+                    await bot.send_message(
+                        chat_id=ADMIN_CHAT_ID,
+                        text=match_message(match, buyer, seller),
+                        parse_mode="HTML",
+                        reply_markup=match_keyboard(match_id),
+                        disable_web_page_preview=True,
+                    )
+                    await asyncio.to_thread(db_mark_match_sent, match_id)
+                    log.info("Match %s sent", match_id)
+                except Exception as exc:
+                    log.exception("Failed to send match %s", match_id)
+                    await asyncio.to_thread(db_mark_match_failed, match_id, str(exc))
         except Exception:
             log.exception("Notification worker error")
 
