@@ -142,6 +142,10 @@ PHOTO_KB = ReplyKeyboardMarkup(
 )
 
 MAX_SELLER_PHOTOS = 5
+SELLER_ALBUM_WAIT_SECONDS = 0.9
+SELLER_ALBUM_BUFFERS: dict[tuple[int, int, str], list[tuple[str, str]]] = {}
+SELLER_ALBUM_TASKS: dict[tuple[int, int, str], asyncio.Task[Any]] = {}
+SELLER_ALBUM_LOCK = asyncio.Lock()
 
 
 def parse_money(text: str) -> int | None:
@@ -1765,27 +1769,96 @@ async def seller_description(message: Message, state: FSMContext) -> None:
     await message.answer(
         "📷 Добавьте до 5 фотографий автомобиля.\n\n"
         "Лучше всего: спереди, сзади, салон, приборная панель и важные детали. "
-        "Отправляйте фото по одному. После первого фото появится кнопка «✅ Готово».\n\n"
+        "Можно отправить несколько фото сразу одним альбомом или по одному. "
+        "После первого фото появится кнопка «✅ Готово».\n\n"
         "Если фото пока нет — нажмите «Пропустить».",
         reply_markup=SKIP_KB,
+    )
+
+
+async def finalize_seller_album(
+    key: tuple[int, int, str],
+    state: FSMContext,
+) -> None:
+    await asyncio.sleep(SELLER_ALBUM_WAIT_SECONDS)
+
+    async with SELLER_ALBUM_LOCK:
+        incoming = SELLER_ALBUM_BUFFERS.pop(key, [])
+        SELLER_ALBUM_TASKS.pop(key, None)
+
+    if not incoming:
+        return
+    if await state.get_state() != SellerForm.photo.state:
+        return
+
+    data = await state.get_data()
+    photo_ids = list(data.get("photo_file_ids") or [])
+    unique_ids = list(data.get("photo_unique_ids") or [])
+    incoming_count = len(incoming)
+
+    for file_id, unique_id in incoming:
+        if unique_id in unique_ids:
+            continue
+        if len(photo_ids) >= MAX_SELLER_PHOTOS:
+            break
+        photo_ids.append(file_id)
+        unique_ids.append(unique_id)
+
+    await state.update_data(
+        photo_file_ids=photo_ids,
+        photo_unique_ids=unique_ids,
+    )
+    count = len(photo_ids)
+
+    if count >= MAX_SELLER_PHOTOS:
+        await state.update_data(
+            photo_file_id=photo_ids[0],
+            photo_unique_id=unique_ids[0],
+        )
+        await state.set_state(SellerForm.contact)
+        extra = " Сохранил первые 5." if incoming_count > MAX_SELLER_PHOTOS else ""
+        await bot.send_message(
+            key[0],
+            f"✅ Добавлено 5 фото — отлично.{extra} Теперь укажите контакт для связи.",
+            reply_markup=CONTACT_KB,
+        )
+        return
+
+    await bot.send_message(
+        key[0],
+        f"✅ Добавлено фото: {count}/{MAX_SELLER_PHOTOS}. Отправьте ещё или нажмите «✅ Готово».",
+        reply_markup=PHOTO_KB,
     )
 
 
 @dp.message(SellerForm.photo)
 async def seller_photo(message: Message, state: FSMContext) -> None:
     text = (message.text or "").strip()
+
+    if message.photo and message.media_group_id:
+        photo = message.photo[-1]
+        user_id = int(message.from_user.id) if message.from_user else 0
+        key = (int(message.chat.id), user_id, str(message.media_group_id))
+        async with SELLER_ALBUM_LOCK:
+            buffer = SELLER_ALBUM_BUFFERS.setdefault(key, [])
+            if all(unique_id != photo.file_unique_id for _, unique_id in buffer):
+                buffer.append((photo.file_id, photo.file_unique_id))
+            if key not in SELLER_ALBUM_TASKS:
+                SELLER_ALBUM_TASKS[key] = asyncio.create_task(finalize_seller_album(key, state))
+        return
+
     data = await state.get_data()
     photo_ids = list(data.get("photo_file_ids") or [])
     unique_ids = list(data.get("photo_unique_ids") or [])
 
     if message.photo:
         photo = message.photo[-1]
-        if photo.file_unique_id not in unique_ids:
+        if photo.file_unique_id not in unique_ids and len(photo_ids) < MAX_SELLER_PHOTOS:
             photo_ids.append(photo.file_id)
             unique_ids.append(photo.file_unique_id)
-        await state.update_data(photo_file_ids=photo_ids[:MAX_SELLER_PHOTOS], photo_unique_ids=unique_ids[:MAX_SELLER_PHOTOS])
+        await state.update_data(photo_file_ids=photo_ids, photo_unique_ids=unique_ids)
 
-        count = min(len(photo_ids), MAX_SELLER_PHOTOS)
+        count = len(photo_ids)
         if count >= MAX_SELLER_PHOTOS:
             await state.update_data(
                 photo_file_id=photo_ids[0],
@@ -1816,7 +1889,7 @@ async def seller_photo(message: Message, state: FSMContext) -> None:
         )
     else:
         await message.answer(
-            "Отправьте фотографию автомобиля. Можно добавить до 5 фото. Когда закончите — нажмите «✅ Готово».",
+            "Отправьте до 5 фотографий автомобиля — можно одним альбомом или по одной. Когда закончите — нажмите «✅ Готово».",
             reply_markup=PHOTO_KB if photo_ids else SKIP_KB,
         )
         return
