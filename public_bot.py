@@ -133,12 +133,21 @@ def save_market_request(payload: dict[str, Any]) -> dict[str, Any]:
     return rows[0]
 
 
+def link_request_to_lead(request_id: int, lead_id: int) -> None:
+    (
+        supabase.table("market_requests")
+        .update({"radar_lead_id": lead_id})
+        .eq("id", request_id)
+        .execute()
+    )
+
+
 def save_buyer_as_lead(request_row: dict[str, Any], message: Message) -> dict[str, Any] | None:
     contact = request_row.get("contact_phone") or request_row.get("contact_telegram") or "не указан"
     budget = request_row.get("budget")
     requirements = request_row.get("requirements") or "без дополнительных требований"
     lead_text = (
-        f"Куплю авто: {request_row.get('vehicle')}. "
+        f"🟢 ПОКУПАТЕЛЬ | Куплю авто: {request_row.get('vehicle')}. "
         f"Город: {request_row.get('city')}. "
         f"Бюджет до {int(budget):,} руб. ".replace(",", " ")
         + f"Требования: {requirements}. Контакт: {contact}"
@@ -146,7 +155,7 @@ def save_buyer_as_lead(request_row: dict[str, Any], message: Message) -> dict[st
     payload = {
         "telegram_message_date": message.date.isoformat() if message.date else None,
         "chat_id": int(message.chat.id),
-        "chat_name": "Куплю авто | Продам авто",
+        "chat_name": "🟢 ПОКУПАТЕЛЬ | AutoClick Market",
         "message_id": int(message.message_id),
         "sender_id": int(message.from_user.id) if message.from_user else None,
         "username": message.from_user.username if message.from_user else None,
@@ -168,29 +177,110 @@ def save_buyer_as_lead(request_row: dict[str, Any], message: Message) -> dict[st
         },
     }
     rows = supabase.table("leads").insert(payload).execute().data or []
-    return rows[0] if rows else None
+    if not rows:
+        return None
+    lead = rows[0]
+    if request_row.get("id") and lead.get("id"):
+        link_request_to_lead(int(request_row["id"]), int(lead["id"]))
+    return lead
 
 
-async def notify_admin_seller(row: dict[str, Any]) -> None:
-    if ADMIN_CHAT_ID is None:
-        return
-    contact = row.get("contact_phone") or row.get("contact_telegram") or "не указан"
-    price = f"{int(row['asking_price']):,}".replace(",", " ")
-    mileage = f"{int(row['mileage_km']):,}".replace(",", " ")
-    text = (
-        "💰 <b>Новая заявка на продажу авто</b>\n\n"
-        f"<b>Город:</b> {row.get('city') or '—'}\n"
-        f"<b>Автомобиль:</b> {row.get('vehicle') or '—'}\n"
-        f"<b>Год:</b> {row.get('vehicle_year') or '—'}\n"
-        f"<b>Цена:</b> {price} ₽\n"
-        f"<b>Пробег:</b> {mileage} км\n"
-        f"<b>Контакт:</b> {contact}\n"
-        f"<b>Заявка:</b> #{row.get('id')}"
+def save_seller_as_lead(request_row: dict[str, Any]) -> dict[str, Any]:
+    contact = request_row.get("contact_phone") or request_row.get("contact_telegram") or "не указан"
+    price = request_row.get("asking_price")
+    mileage = request_row.get("mileage_km")
+    year = request_row.get("vehicle_year")
+
+    price_text = f"{int(price):,}".replace(",", " ") if price is not None else "—"
+    mileage_text = f"{int(mileage):,}".replace(",", " ") if mileage is not None else "—"
+    lead_text = (
+        f"🔵 ПРОДАВЕЦ | Продам авто: {request_row.get('vehicle')}. "
+        f"Город: {request_row.get('city')}. "
+        f"Год: {year or '—'}. "
+        f"Цена: {price_text} руб. "
+        f"Пробег: {mileage_text} км. "
+        f"Контакт: {contact}"
     )
-    try:
-        await bot.send_message(ADMIN_CHAT_ID, text, parse_mode="HTML")
-    except Exception:
-        log.exception("Could not notify admin about seller request %s", row.get("id"))
+
+    telegram_user_id = int(request_row.get("telegram_user_id") or 0)
+    telegram_message_id = int(request_row.get("telegram_message_id") or request_row.get("id") or 0)
+
+    payload = {
+        "chat_id": telegram_user_id,
+        "chat_name": "🔵 ПРОДАВЕЦ | AutoClick Market",
+        "message_id": telegram_message_id,
+        "sender_id": telegram_user_id or None,
+        "username": request_row.get("username"),
+        "sender_name": request_row.get("full_name"),
+        "message_text": lead_text,
+        "message_link": f"https://t.me/{PUBLIC_BOT_USERNAME}",
+        "category": "auto",
+        "city": request_row.get("city"),
+        "budget": price,
+        "currency": "RUB",
+        "status": "new",
+        "source_id": None,
+        "raw_data": {
+            "ingestion": "public_telegram_bot",
+            "market_request_id": request_row.get("id"),
+            "request_type": "seller",
+            "vehicle": request_row.get("vehicle"),
+            "vehicle_year": year,
+            "mileage_km": mileage,
+            "asking_price": price,
+            "contact_phone": request_row.get("contact_phone"),
+            "contact_telegram": request_row.get("contact_telegram"),
+        },
+    }
+
+    rows = supabase.table("leads").insert(payload).execute().data or []
+    if not rows:
+        raise RuntimeError("seller lead was not saved")
+
+    lead = rows[0]
+    lead_id = int(lead["id"])
+    forced = {
+        "lead_score": 70,
+        "rule_score": 70,
+        "lead_quality": "warm",
+        "matched_keywords": ["продам авто"],
+        "score_reasons": {
+            "seller_request": True,
+            "has_city": bool(request_row.get("city")),
+            "has_price": price is not None,
+            "specific_vehicle": bool(request_row.get("vehicle")),
+        },
+        "notification_status": "pending",
+        "notification_claimed_at": None,
+        "notification_error": None,
+    }
+    updated = supabase.table("leads").update(forced).eq("id", lead_id).execute().data or []
+    if updated:
+        lead = updated[0]
+
+    if request_row.get("id"):
+        link_request_to_lead(int(request_row["id"]), lead_id)
+    return lead
+
+
+def backfill_seller_radar_leads(limit: int = 50) -> None:
+    rows = (
+        supabase.table("market_requests")
+        .select("*")
+        .eq("request_type", "seller")
+        .is_("radar_lead_id", "null")
+        .order("created_at")
+        .limit(limit)
+        .execute()
+        .data
+        or []
+    )
+    for row in rows:
+        try:
+            lead = save_seller_as_lead(row)
+            log.info("Backfilled seller request %s to Radar lead %s", row.get("id"), lead.get("id"))
+        except Exception:
+            log.exception("Could not backfill seller request %s", row.get("id"))
 
 
 @dp.message(CommandStart())
@@ -411,7 +501,7 @@ async def seller_contact(message: Message, state: FSMContext) -> None:
     }
     try:
         row = await asyncio.to_thread(save_market_request, payload)
-        await notify_admin_seller(row)
+        await asyncio.to_thread(save_seller_as_lead, row)
     except Exception:
         log.exception("Failed to save seller request")
         await message.answer("Не удалось сохранить заявку. Попробуйте ещё раз позже.", reply_markup=MAIN_KB)
@@ -432,6 +522,7 @@ async def fallback(message: Message) -> None:
 
 async def main() -> None:
     log.info("Starting public auto bot @%s", PUBLIC_BOT_USERNAME)
+    await asyncio.to_thread(backfill_seller_radar_leads)
     await dp.start_polling(bot)
 
 
