@@ -67,6 +67,9 @@ class SellerForm(StatesGroup):
     year = State()
     price = State()
     mileage = State()
+    trim = State()
+    description = State()
+    photo = State()
     contact = State()
 
 
@@ -679,6 +682,9 @@ def request_card(row: dict[str, Any]) -> str:
             f"📅 Год: {esc(row.get('vehicle_year'))}",
             f"💰 Цена: {esc(format_rub(row.get('asking_price')))}",
             f"🛣 Пробег: {esc(row.get('mileage_km'))} км",
+            f"⚙️ Комплектация: {esc(row.get('vehicle_trim') or 'не указана')}",
+            f"📝 Описание: {esc(row.get('seller_description') or 'нет')}",
+            f"📷 Фото: {'добавлено' if row.get('photo_file_id') else 'нет'}",
         ])
     return "\n".join(body)
 
@@ -709,7 +715,9 @@ def edit_fields_keyboard(row: dict[str, Any]) -> InlineKeyboardMarkup:
         fields = [
             ("📍 Город", "city"), ("🚙 Авто", "vehicle"),
             ("📅 Год", "vehicle_year"), ("💰 Цена", "asking_price"),
-            ("🛣 Пробег", "mileage_km"), ("☎️ Контакт", "contact"),
+            ("🛣 Пробег", "mileage_km"), ("⚙️ Комплектация", "vehicle_trim"),
+            ("📝 Описание", "seller_description"), ("📷 Фото", "photo_file_id"),
+            ("☎️ Контакт", "contact"),
         ]
     rows: list[list[InlineKeyboardButton]] = []
     for i in range(0, len(fields), 2):
@@ -733,6 +741,9 @@ def edit_field_prompt(field: str) -> str:
         "vehicle_year": "Введите новый год автомобиля, например 2020.",
         "asking_price": "Введите новую цену, например 2,5 млн или 2 500 000 ₽.",
         "mileage_km": "Введите новый пробег автомобиля, например 85000.",
+        "vehicle_trim": "Введите комплектацию автомобиля, например M Sport, Elegance или Comfort. Если не хотите указывать — напишите «Пропустить».",
+        "seller_description": "Введите краткое описание автомобиля: состояние, владельцы, ДТП, обслуживание и важные особенности. До 1000 символов. Если не хотите указывать — напишите «Пропустить».",
+        "photo_file_id": "Отправьте главное фото автомобиля. Чтобы удалить текущее фото — напишите «Удалить».",
         "contact": "Отправьте новый телефон или @username.",
     }
     return prompts.get(field, "Введите новое значение.")
@@ -767,7 +778,11 @@ def sync_request_lead(row: dict[str, Any]) -> None:
             f"🔵 ПРОДАВЕЦ | Продам авто: {row.get('vehicle')}. "
             f"Город: {row.get('city')}. Год: {row.get('vehicle_year')}. "
             f"Цена: {format_rub(row.get('asking_price'))}. "
-            f"Пробег: {row.get('mileage_km')} км. Контакт: {contact_text(row)}"
+            f"Пробег: {row.get('mileage_km')} км. "
+            f"Комплектация: {row.get('vehicle_trim') or 'не указана'}. "
+            f"Описание: {row.get('seller_description') or 'нет'}. "
+            f"Фото: {'есть' if row.get('photo_file_id') else 'нет'}. "
+            f"Контакт: {contact_text(row)}"
         )
         updates = {"city": row.get("city"), "budget": row.get("asking_price"), "message_text": text}
     supabase.table("leads").update(updates).eq("id", int(lead_id)).execute()
@@ -873,7 +888,9 @@ async def send_match_offer(match: dict[str, Any], buyer: dict[str, Any], seller:
         f"📍 <b>Город:</b> {esc(seller.get('city'))}\n"
         f"📅 <b>Год:</b> {esc(seller.get('vehicle_year'))}\n"
         f"💰 <b>Цена:</b> {esc(format_rub(seller.get('asking_price')))}\n"
-        f"🛣 <b>Пробег:</b> {esc(seller.get('mileage_km'))} км\n\n"
+        f"🛣 <b>Пробег:</b> {esc(seller.get('mileage_km'))} км\n"
+        f"⚙️ <b>Комплектация:</b> {esc(seller.get('vehicle_trim') or 'не указана')}\n"
+        f"📝 <b>Описание:</b> {esc(str(seller.get('seller_description') or 'нет')[:300])}\n\n"
         "Контакт продавца пока скрыт. Если предложение интересно, подтвердите — контакт откроется только после согласия обеих сторон."
     )
     seller_text = (
@@ -892,12 +909,21 @@ async def send_match_offer(match: dict[str, Any], buyer: dict[str, Any], seller:
 
     if not buyer_sent_at:
         try:
-            await bot.send_message(
-                buyer_chat_id,
-                buyer_text,
-                parse_mode="HTML",
-                reply_markup=offer_keyboard(match_id, "buyer"),
-            )
+            if seller.get("photo_file_id"):
+                await bot.send_photo(
+                    buyer_chat_id,
+                    photo=str(seller["photo_file_id"]),
+                    caption=buyer_text,
+                    parse_mode="HTML",
+                    reply_markup=offer_keyboard(match_id, "buyer"),
+                )
+            else:
+                await bot.send_message(
+                    buyer_chat_id,
+                    buyer_text,
+                    parse_mode="HTML",
+                    reply_markup=offer_keyboard(match_id, "buyer"),
+                )
             buyer_sent_at = datetime.now(timezone.utc).isoformat()
             await asyncio.to_thread(
                 lambda: supabase.table("auto_matches")
@@ -1073,6 +1099,9 @@ def save_seller_as_lead(request_row: dict[str, Any]) -> dict[str, Any]:
         f"Год: {year or '—'}. "
         f"Цена: {price_text} руб. "
         f"Пробег: {mileage_text} км. "
+        f"Комплектация: {request_row.get('vehicle_trim') or 'не указана'}. "
+        f"Описание: {request_row.get('seller_description') or 'нет'}. "
+        f"Фото: {'есть' if request_row.get('photo_file_id') else 'нет'}. "
         f"Контакт: {contact}"
     )
 
@@ -1102,6 +1131,9 @@ def save_seller_as_lead(request_row: dict[str, Any]) -> dict[str, Any]:
             "vehicle_year": year,
             "mileage_km": mileage,
             "asking_price": price,
+            "vehicle_trim": request_row.get("vehicle_trim"),
+            "seller_description": request_row.get("seller_description"),
+            "has_photo": bool(request_row.get("photo_file_id")),
             "contact_phone": request_row.get("contact_phone"),
             "contact_telegram": request_row.get("contact_telegram"),
         },
@@ -1419,7 +1451,7 @@ async def request_field_callback(callback: CallbackQuery, state: FSMContext) -> 
         return
 
     buyer_fields = {"city", "vehicle", "budget", "min_vehicle_year", "max_vehicle_year", "max_mileage_km", "requirements", "contact"}
-    seller_fields = {"city", "vehicle", "vehicle_year", "asking_price", "mileage_km", "contact"}
+    seller_fields = {"city", "vehicle", "vehicle_year", "asking_price", "mileage_km", "vehicle_trim", "seller_description", "photo_file_id", "contact"}
     allowed = buyer_fields if row.get("request_type") == "buyer" else seller_fields
     if field not in allowed:
         await callback.answer("Это поле недоступно", show_alert=True)
@@ -1429,7 +1461,12 @@ async def request_field_callback(callback: CallbackQuery, state: FSMContext) -> 
     await state.update_data(edit_request_id=request_id, edit_field=field)
     await callback.answer()
     if callback.message:
-        reply_markup = CONTACT_KB if field == "contact" else ReplyKeyboardRemove()
+        if field == "contact":
+            reply_markup = CONTACT_KB
+        elif field in {"vehicle_trim", "seller_description"}:
+            reply_markup = SKIP_KB
+        else:
+            reply_markup = ReplyKeyboardRemove()
         await callback.message.answer(edit_field_prompt(field), reply_markup=reply_markup)
 
 
@@ -1479,6 +1516,21 @@ async def edit_request_value_handler(message: Message, state: FSMContext) -> Non
         updates[field] = value
     elif field == "requirements":
         updates[field] = None if text.lower() == "пропустить" else text[:500]
+    elif field == "vehicle_trim":
+        updates[field] = None if text.lower() == "пропустить" else text[:200]
+    elif field == "seller_description":
+        updates[field] = None if text.lower() == "пропустить" else text[:1000]
+    elif field == "photo_file_id":
+        if message.photo:
+            photo = message.photo[-1]
+            updates["photo_file_id"] = photo.file_id
+            updates["photo_unique_id"] = photo.file_unique_id
+        elif text.lower() in {"удалить", "удалить фото", "пропустить"}:
+            updates["photo_file_id"] = None
+            updates["photo_unique_id"] = None
+        else:
+            await message.answer("Отправьте фотографию автомобиля или напишите «Удалить».")
+            return
     elif field == "contact":
         phone, telegram = contact_from_message(message)
         if not phone and not telegram:
@@ -1609,6 +1661,48 @@ async def seller_mileage(message: Message, state: FSMContext) -> None:
         await message.answer("Напишите пробег цифрами, например 85000.")
         return
     await state.update_data(mileage_km=value)
+    await state.set_state(SellerForm.trim)
+    await message.answer(
+        "Какая комплектация автомобиля? Например: M Sport, Elegance или Comfort.\nЕсли не хотите указывать — нажмите «Пропустить».",
+        reply_markup=SKIP_KB,
+    )
+
+
+@dp.message(SellerForm.trim)
+async def seller_trim(message: Message, state: FSMContext) -> None:
+    text = (message.text or "").strip()
+    vehicle_trim = None if text == "Пропустить" else text[:200]
+    await state.update_data(vehicle_trim=vehicle_trim)
+    await state.set_state(SellerForm.description)
+    await message.answer(
+        "Кратко опишите автомобиль: состояние, владельцы, ДТП, обслуживание и важные особенности.\nЕсли не хотите указывать — нажмите «Пропустить».",
+        reply_markup=SKIP_KB,
+    )
+
+
+@dp.message(SellerForm.description)
+async def seller_description(message: Message, state: FSMContext) -> None:
+    text = (message.text or "").strip()
+    description = None if text == "Пропустить" else text[:1000]
+    await state.update_data(seller_description=description)
+    await state.set_state(SellerForm.photo)
+    await message.answer(
+        "📷 Отправьте главное фото автомобиля. Покупатель увидит его только после того, как AutoClick подтвердит совпадение.\nЕсли фото пока нет — нажмите «Пропустить».",
+        reply_markup=SKIP_KB,
+    )
+
+
+@dp.message(SellerForm.photo)
+async def seller_photo(message: Message, state: FSMContext) -> None:
+    text = (message.text or "").strip()
+    if message.photo:
+        photo = message.photo[-1]
+        await state.update_data(photo_file_id=photo.file_id, photo_unique_id=photo.file_unique_id)
+    elif text == "Пропустить":
+        await state.update_data(photo_file_id=None, photo_unique_id=None)
+    else:
+        await message.answer("Отправьте фотографию автомобиля или нажмите «Пропустить».", reply_markup=SKIP_KB)
+        return
     await state.set_state(SellerForm.contact)
     await message.answer(
         "Как с вами связаться?\nМожно отправить номер телефона или оставить ваш Telegram.",
@@ -1641,6 +1735,10 @@ async def seller_contact(message: Message, state: FSMContext) -> None:
         "vehicle_year": data["vehicle_year"],
         "asking_price": data["asking_price"],
         "mileage_km": data["mileage_km"],
+        "vehicle_trim": data.get("vehicle_trim"),
+        "seller_description": data.get("seller_description"),
+        "photo_file_id": data.get("photo_file_id"),
+        "photo_unique_id": data.get("photo_unique_id"),
         "contact_phone": phone,
         "contact_telegram": telegram or ident["contact_telegram"],
         "status": "new",
