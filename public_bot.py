@@ -53,6 +53,9 @@ class BuyerForm(StatesGroup):
     city = State()
     vehicle = State()
     budget = State()
+    min_year = State()
+    max_year = State()
+    max_mileage = State()
     requirements = State()
     contact = State()
 
@@ -245,22 +248,53 @@ def vehicle_similarity(buyer_vehicle: Any, seller_vehicle: Any) -> float:
 
 
 def evaluate_match(buyer: dict[str, Any], seller: dict[str, Any]) -> tuple[int, dict[str, Any]] | None:
+    # Year and mileage are mandatory buyer criteria. Legacy buyer requests without
+    # them stay in the database but do not create automatic matches.
+    min_year = buyer.get("min_vehicle_year")
+    max_year = buyer.get("max_vehicle_year")
+    max_mileage = buyer.get("max_mileage_km")
+    seller_year = seller.get("vehicle_year")
+    seller_mileage = seller.get("mileage_km")
+    if min_year is None or max_year is None or max_mileage is None or seller_year is None or seller_mileage is None:
+        return None
+
+    min_year = int(min_year)
+    max_year = int(max_year)
+    max_mileage = int(max_mileage)
+    seller_year = int(seller_year)
+    seller_mileage = int(seller_mileage)
+
+    # Hard filters: wrong year or excessive mileage means no match.
+    if seller_year < min_year or seller_year > max_year:
+        return None
+    if seller_mileage > max_mileage:
+        return None
+
     similarity = vehicle_similarity(buyer.get("vehicle"), seller.get("vehicle"))
     if similarity < 0.58:
         return None
 
-    score = round(similarity * 60)
+    score = round(similarity * 50)
     reasons: dict[str, Any] = {
         "vehicle_similarity": round(similarity, 2),
         "vehicle_match": similarity >= 0.82,
+        "year_match": True,
+        "buyer_min_year": min_year,
+        "buyer_max_year": max_year,
+        "seller_year": seller_year,
+        "mileage_match": True,
+        "buyer_max_mileage_km": max_mileage,
+        "seller_mileage_km": seller_mileage,
     }
+    score += 10
+    score += 10
 
     buyer_city = normalize_city(buyer.get("city"))
     seller_city = normalize_city(seller.get("city"))
     same_city = bool(buyer_city and seller_city and buyer_city == seller_city)
     reasons["same_city"] = same_city
     if same_city:
-        score += 15
+        score += 10
 
     budget = buyer.get("budget")
     price = seller.get("asking_price")
@@ -272,14 +306,14 @@ def evaluate_match(buyer: dict[str, Any], seller: dict[str, Any]) -> tuple[int, 
         ratio = price_value / budget_value
         reasons["price_to_budget"] = round(ratio, 3)
         if ratio <= 1.0:
-            score += 25
+            score += 20
             reasons["within_budget"] = True
         elif ratio <= 1.10:
-            score += 12
+            score += 10
             reasons["within_budget"] = False
             reasons["slightly_over_budget"] = True
         elif ratio <= 1.20:
-            score += 5
+            score += 4
             reasons["within_budget"] = False
             reasons["over_budget"] = True
         else:
@@ -291,7 +325,6 @@ def evaluate_match(buyer: dict[str, Any], seller: dict[str, Any]) -> tuple[int, 
     if score < MATCH_THRESHOLD:
         return None
     return score, reasons
-
 
 def insert_match_if_new(buyer: dict[str, Any], seller: dict[str, Any]) -> dict[str, Any] | None:
     buyer_id = int(buyer["id"])
@@ -496,6 +529,8 @@ async def send_match_offer(match: dict[str, Any], buyer: dict[str, Any], seller:
         f"🔗 <b>Найден покупатель · совпадение {int(match.get('match_score') or 0)}%</b>\n\n"
         f"🚗 <b>Ищет:</b> {esc(buyer.get('vehicle'))}\n"
         f"📍 <b>Город:</b> {esc(buyer.get('city'))}\n"
+        f"📅 <b>Год:</b> {esc(buyer.get('min_vehicle_year'))}–{esc(buyer.get('max_vehicle_year'))}\n"
+        f"🛣 <b>Пробег:</b> до {esc(buyer.get('max_mileage_km'))} км\n"
         f"💰 <b>Бюджет:</b> {esc(format_rub(buyer.get('budget')))}\n"
         f"📝 <b>Требования:</b> {esc(buyer.get('requirements') or 'без дополнительных требований')}\n\n"
         "Контакт покупателя пока скрыт. Если готовы продолжить, подтвердите — контакт откроется только после согласия обеих сторон."
@@ -627,6 +662,8 @@ def save_buyer_as_lead(request_row: dict[str, Any], message: Message) -> dict[st
         f"🟢 ПОКУПАТЕЛЬ | Куплю авто: {request_row.get('vehicle')}. "
         f"Город: {request_row.get('city')}. "
         f"Бюджет до {int(budget):,} руб. ".replace(",", " ")
+        + f"Год {request_row.get('min_vehicle_year')}–{request_row.get('max_vehicle_year')}. "
+        + f"Пробег до {request_row.get('max_mileage_km')} км. "
         + f"Требования: {requirements}. Контакт: {contact}"
     )
     payload = {
@@ -649,6 +686,9 @@ def save_buyer_as_lead(request_row: dict[str, Any], message: Message) -> dict[st
             "ingestion": "public_telegram_bot",
             "market_request_id": request_row.get("id"),
             "request_type": "buyer",
+            "min_vehicle_year": request_row.get("min_vehicle_year"),
+            "max_vehicle_year": request_row.get("max_vehicle_year"),
+            "max_mileage_km": request_row.get("max_mileage_km"),
             "contact_phone": request_row.get("contact_phone"),
             "contact_telegram": request_row.get("contact_telegram"),
         },
@@ -827,9 +867,44 @@ async def buyer_budget(message: Message, state: FSMContext) -> None:
         await message.answer("Не понял бюджет. Напишите, например: 2,5 млн или 2 500 000.")
         return
     await state.update_data(budget=value)
+    await state.set_state(BuyerForm.min_year)
+    await message.answer("Минимальный год автомобиля? Например: 2020. Машины старше указанного года в совпадение не попадут.")
+
+
+@dp.message(BuyerForm.min_year)
+async def buyer_min_year(message: Message, state: FSMContext) -> None:
+    year = parse_int(message.text or "")
+    if year is None or year < 1950 or year > 2035:
+        await message.answer("Напишите минимальный год четырьмя цифрами, например 2020.")
+        return
+    await state.update_data(min_vehicle_year=year)
+    await state.set_state(BuyerForm.max_year)
+    await message.answer("Максимальный год автомобиля? Например: 2026.")
+
+
+@dp.message(BuyerForm.max_year)
+async def buyer_max_year(message: Message, state: FSMContext) -> None:
+    year = parse_int(message.text or "")
+    data = await state.get_data()
+    min_year = int(data.get("min_vehicle_year") or 0)
+    if year is None or year < min_year or year > 2035:
+        await message.answer(f"Максимальный год должен быть не меньше {min_year}. Например: 2026.")
+        return
+    await state.update_data(max_vehicle_year=year)
+    await state.set_state(BuyerForm.max_mileage)
+    await message.answer("Максимальный пробег, который рассматриваете? Например: 100000 км.")
+
+
+@dp.message(BuyerForm.max_mileage)
+async def buyer_max_mileage(message: Message, state: FSMContext) -> None:
+    mileage = parse_int(message.text or "")
+    if mileage is None or mileage < 0 or mileage > 2_000_000:
+        await message.answer("Напишите максимальный пробег цифрами, например 100000.")
+        return
+    await state.update_data(max_mileage_km=mileage)
     await state.set_state(BuyerForm.requirements)
     await message.answer(
-        "Есть дополнительные требования? Год, пробег, привод, цвет и т.д.\nЕсли нет — нажмите «Пропустить».",
+        "Есть дополнительные требования? Привод, цвет, комплектация и т.д.\nЕсли нет — нажмите «Пропустить».",
         reply_markup=SKIP_KB,
     )
 
@@ -869,6 +944,9 @@ async def buyer_contact(message: Message, state: FSMContext) -> None:
         "city": data["city"],
         "vehicle": data["vehicle"],
         "budget": data["budget"],
+        "min_vehicle_year": data["min_vehicle_year"],
+        "max_vehicle_year": data["max_vehicle_year"],
+        "max_mileage_km": data["max_mileage_km"],
         "requirements": data.get("requirements"),
         "contact_phone": phone,
         "contact_telegram": telegram or ident["contact_telegram"],
