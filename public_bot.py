@@ -911,7 +911,19 @@ def update_request_owned(request_id: int, telegram_user_id: int, updates: dict[s
         return "not_found", None
     updated = rows[0]
     sync_request_lead(updated)
-    if updated.get("status") in MATCHING_REQUEST_STATUSES:
+
+    # Re-run matching only when a field that actually affects matching changed.
+    # Cosmetic/contact edits must not expire existing matches or create duplicates.
+    matching_fields = (
+        {"city", "vehicle", "budget", "min_vehicle_year", "max_vehicle_year", "max_mileage_km"}
+        if row.get("request_type") == "buyer"
+        else {"city", "vehicle", "vehicle_year", "asking_price", "mileage_km"}
+    )
+    matching_changed = any(
+        field in updates and updates.get(field) != row.get(field)
+        for field in matching_fields
+    )
+    if updated.get("status") in MATCHING_REQUEST_STATUSES and matching_changed:
         expire_matches_for_request(request_id)
         create_matches_for_request(updated)
     return "ok", updated
