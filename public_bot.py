@@ -17,6 +17,7 @@ from aiogram.fsm.storage.base import BaseStorage, StateType, StorageKey
 from aiogram.types import (
     BotCommand,
     CallbackQuery,
+    FSInputFile,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     KeyboardButton,
@@ -185,34 +186,48 @@ MAIN_KB = ReplyKeyboardMarkup(
 
 
 START_TEXT = (
-    "🚘 <b>AutoClick — автомобиль найдёт вас</b>\n\n"
-    "Оставьте одну заявку — система сопоставит покупателей и продавцов по автомобилю, "
-    "бюджету, году и пробегу.\n\n"
-    "🔎 <b>Покупателю:</b> укажите, какой автомобиль ищете и ваши условия.\n"
-    "💰 <b>Продавцу:</b> добавьте автомобиль, цену, описание и фото.\n\n"
-    "🔒 Контакты скрыты и открываются только после взаимного интереса.\n"
-    "✅ Размещение заявки бесплатно.\n\n"
-    "<b>Один запрос — больше выбора</b>\n\n"
-    "Что вы хотите сделать?"
+    "Привет! 👋\n"
+    "Я <b>AutoClick</b> — помогаю людям покупать и продавать авто в Telegram.\n\n"
+    "Выберите, что вас интересует:"
+)
+
+START_BANNER_PATH = os.path.join(os.path.dirname(__file__), "autoclick_start.jpg")
+
+START_INLINE_KB = InlineKeyboardMarkup(
+    inline_keyboard=[
+        [InlineKeyboardButton(text="🔎 Купить авто", callback_data="start:buy")],
+        [InlineKeyboardButton(text="🚘 Продать авто", callback_data="start:sell")],
+        [InlineKeyboardButton(text="📋 Мои заявки", callback_data="start:my")],
+    ]
 )
 
 HELP_TEXT = (
-    "ℹ️ <b>Как работает AutoClick</b>\n\n"
-    "1️⃣ Создайте заявку на покупку или продажу автомобиля.\n"
-    "2️⃣ AutoClick сравнит параметры заявок.\n"
-    "3️⃣ При подходящем совпадении обе стороны получат предложение.\n"
-    "4️⃣ Контакты откроются только после подтверждения интереса обеими сторонами.\n\n"
-    "Ваш телефон не публикуется открыто. Заявку можно изменить или закрыть через «📋 Мои заявки».\n\n"
-    "Команды: /buy — купить, /sell — продать, /my — мои заявки, /help — помощь, /cancel — отмена."
+    "❓ <b>Помощь</b>\n"
+    "Здесь основная информация о том, как работает AutoClick.\n\n"
+    "🚙 <b>Как купить авто?</b>\n"
+    "1. Нажмите «Купить авто».\n"
+    "2. Заполните город, автомобиль, бюджет, год и пробег.\n"
+    "3. Получайте подходящие предложения.\n"
+    "4. Нажмите «Интересно», если вариант подходит.\n\n"
+    "💰 <b>Как продать авто?</b>\n"
+    "1. Нажмите «Продать авто».\n"
+    "2. Заполните информацию об автомобиле.\n"
+    "3. Добавьте до 5 фотографий.\n"
+    "4. Получайте заинтересованных покупателей.\n\n"
+    "📋 <b>Мои заявки</b>\n"
+    "Здесь можно посмотреть заявки, изменить их, приостановить, возобновить или закрыть.\n\n"
+    "🤝 <b>Как происходит контакт?</b>\n"
+    "Контакты скрыты. Когда покупатель и продавец оба нажимают «Интересно», AutoClick открывает контактные данные обеим сторонам.\n\n"
+    "⏸ Если поиск или продажа временно не нужны — поставьте заявку на паузу. После возобновления она снова участвует в подборе."
 )
 
 BOT_COMMANDS = [
-    BotCommand(command="start", description="Главное меню"),
-    BotCommand(command="buy", description="Хочу купить авто"),
-    BotCommand(command="sell", description="Хочу продать авто"),
+    BotCommand(command="start", description="Запустить бота"),
+    BotCommand(command="buy", description="Купить авто"),
+    BotCommand(command="sell", description="Продать авто"),
     BotCommand(command="my", description="Мои заявки"),
-    BotCommand(command="help", description="Как работает AutoClick"),
-    BotCommand(command="cancel", description="Отменить текущее действие"),
+    BotCommand(command="help", description="Помощь"),
+    BotCommand(command="cancel", description="Отменить действие"),
 ]
 
 CONTACT_KB = ReplyKeyboardMarkup(
@@ -1448,13 +1463,60 @@ def backfill_seller_radar_leads(limit: int = 50) -> None:
 @dp.message(CommandStart())
 async def start_handler(message: Message, state: FSMContext) -> None:
     await state.clear()
-    await message.answer(START_TEXT, parse_mode="HTML", reply_markup=MAIN_KB)
+    if os.path.exists(START_BANNER_PATH):
+        await message.answer_photo(
+            FSInputFile(START_BANNER_PATH),
+            caption=START_TEXT,
+            parse_mode="HTML",
+            reply_markup=START_INLINE_KB,
+        )
+    else:
+        await message.answer(START_TEXT, parse_mode="HTML", reply_markup=START_INLINE_KB)
+
+
+@dp.callback_query(F.data == "start:buy")
+async def start_buy_callback(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    await state.set_state(BuyerForm.city)
+    await callback.answer()
+    if callback.message:
+        await callback.message.answer("В каком городе ищете автомобиль?", reply_markup=ReplyKeyboardRemove())
+
+
+@dp.callback_query(F.data == "start:sell")
+async def start_sell_callback(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    await state.set_state(SellerForm.city)
+    await callback.answer()
+    if callback.message:
+        await callback.message.answer("В каком городе находится автомобиль?", reply_markup=ReplyKeyboardRemove())
+
+
+@dp.callback_query(F.data == "start:my")
+async def start_my_callback(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    if not callback.from_user:
+        return
+    await callback.answer()
+    rows = await asyncio.to_thread(get_user_requests, int(callback.from_user.id))
+    if not callback.message:
+        return
+    if not rows:
+        await callback.message.answer("У вас пока нет заявок.", reply_markup=MAIN_KB)
+        return
+    await callback.message.answer("📋 <b>Ваши последние заявки</b>", parse_mode="HTML", reply_markup=MAIN_KB)
+    for row in rows:
+        await callback.message.answer(
+            request_card(row),
+            parse_mode="HTML",
+            reply_markup=request_actions_keyboard(row),
+        )
 
 
 @dp.message(Command("help"))
 async def help_handler(message: Message, state: FSMContext) -> None:
     await state.clear()
-    await message.answer(HELP_TEXT, parse_mode="HTML", reply_markup=MAIN_KB)
+    await message.answer(HELP_TEXT, parse_mode="HTML", reply_markup=START_INLINE_KB)
 
 
 @dp.message(Command("cancel"))
