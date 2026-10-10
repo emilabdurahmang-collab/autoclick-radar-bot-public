@@ -15,7 +15,6 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.base import BaseStorage, StateType, StorageKey
 from aiogram.types import (
-    BotCommand,
     CallbackQuery,
     FSInputFile,
     InlineKeyboardButton,
@@ -216,15 +215,6 @@ HELP_TEXT = (
     "Контакты скрыты. Когда покупатель и продавец оба нажимают «Интересно», AutoClick открывает контактные данные обеим сторонам.\n\n"
     "⏸ Если поиск или продажа временно не нужны — поставьте заявку на паузу. После возобновления она снова участвует в подборе."
 )
-
-BOT_COMMANDS = [
-    BotCommand(command="start", description="Запустить бота"),
-    BotCommand(command="buy", description="Купить авто"),
-    BotCommand(command="sell", description="Продать авто"),
-    BotCommand(command="my", description="Мои заявки"),
-    BotCommand(command="help", description="Помощь"),
-    BotCommand(command="cancel", description="Отменить действие"),
-]
 
 CONTACT_KB = ReplyKeyboardMarkup(
     keyboard=[
@@ -2387,7 +2377,7 @@ async def fallback(message: Message) -> None:
 async def main() -> None:
     log.info("Starting public auto bot @%s", PUBLIC_BOT_USERNAME)
     try:
-        await bot.set_my_commands(BOT_COMMANDS)
+        await bot.delete_my_commands()
         await bot.set_my_short_description(
             "AutoClick Market — покупка и продажа авто через умные совпадения заявок."
         )
