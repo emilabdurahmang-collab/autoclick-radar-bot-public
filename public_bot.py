@@ -257,7 +257,7 @@ def find_active_duplicate(payload: dict[str, Any], fingerprint: str) -> dict[str
         .eq("telegram_user_id", int(payload.get("telegram_user_id") or 0))
         .eq("request_type", payload.get("request_type"))
         .eq("request_fingerprint", fingerprint)
-        .in_("status", ["new", "in_progress"])
+        .in_("status", ["new", "in_progress", "paused"])
         .order("created_at")
         .limit(1)
         .execute()
@@ -699,7 +699,8 @@ def format_number(value: Any) -> str:
         return str(value)
 
 
-ACTIVE_REQUEST_STATUSES = {"new", "in_progress"}
+MATCHING_REQUEST_STATUSES = {"new", "in_progress"}
+MANAGEABLE_REQUEST_STATUSES = {"new", "in_progress", "paused"}
 
 
 def get_user_requests(telegram_user_id: int, limit: int = 12) -> list[dict[str, Any]]:
@@ -726,6 +727,7 @@ def request_status_text(row: dict[str, Any]) -> str:
     return {
         "new": "🟢 Активна",
         "in_progress": "🟡 В работе",
+        "paused": "⏸ На паузе",
         "done": "✅ Закрыта",
         "rejected": "⛔ Закрыта",
     }.get(str(row.get("status") or ""), str(row.get("status") or "—"))
@@ -762,12 +764,19 @@ def request_card(row: dict[str, Any]) -> str:
 
 
 def request_actions_keyboard(row: dict[str, Any]) -> InlineKeyboardMarkup | None:
-    if row.get("status") not in ACTIVE_REQUEST_STATUSES:
+    status = str(row.get("status") or "")
+    if status not in MANAGEABLE_REQUEST_STATUSES:
         return None
     request_id = int(row["id"])
     success_reason = "bought" if row.get("request_type") == "buyer" else "sold"
     success_text = "✅ Купил авто" if success_reason == "bought" else "✅ Продано"
+    pause_button = (
+        InlineKeyboardButton(text="▶️ Возобновить", callback_data=f"reqstate:{request_id}:resume")
+        if status == "paused"
+        else InlineKeyboardButton(text="⏸ Приостановить", callback_data=f"reqstate:{request_id}:pause")
+    )
     return InlineKeyboardMarkup(inline_keyboard=[
+        [pause_button],
         [InlineKeyboardButton(text="✏️ Изменить", callback_data=f"reqedit:{request_id}")],
         [InlineKeyboardButton(text=success_text, callback_data=f"reqclose:{request_id}:{success_reason}")],
         [InlineKeyboardButton(text="🛑 Закрыть заявку", callback_data=f"reqclose:{request_id}:cancelled")],
@@ -864,7 +873,7 @@ def update_request_owned(request_id: int, telegram_user_id: int, updates: dict[s
     row = get_request(request_id)
     if not row or int(row.get("telegram_user_id") or 0) != telegram_user_id:
         return "not_found", None
-    if row.get("status") not in ACTIVE_REQUEST_STATUSES:
+    if row.get("status") not in MANAGEABLE_REQUEST_STATUSES:
         return "closed", row
 
     merged = dict(row)
@@ -876,7 +885,7 @@ def update_request_owned(request_id: int, telegram_user_id: int, updates: dict[s
         .eq("telegram_user_id", telegram_user_id)
         .eq("request_type", row.get("request_type"))
         .eq("request_fingerprint", fingerprint)
-        .in_("status", ["new", "in_progress"])
+        .in_("status", ["new", "in_progress", "paused"])
         .neq("id", request_id)
         .limit(1)
         .execute()
@@ -893,7 +902,7 @@ def update_request_owned(request_id: int, telegram_user_id: int, updates: dict[s
         .update(payload)
         .eq("id", request_id)
         .eq("telegram_user_id", telegram_user_id)
-        .in_("status", ["new", "in_progress"])
+        .in_("status", ["new", "in_progress", "paused"])
         .execute()
         .data
         or []
@@ -901,9 +910,10 @@ def update_request_owned(request_id: int, telegram_user_id: int, updates: dict[s
     if not rows:
         return "not_found", None
     updated = rows[0]
-    expire_matches_for_request(request_id)
     sync_request_lead(updated)
-    create_matches_for_request(updated)
+    if updated.get("status") in MATCHING_REQUEST_STATUSES:
+        expire_matches_for_request(request_id)
+        create_matches_for_request(updated)
     return "ok", updated
 
 
@@ -911,7 +921,7 @@ def close_request_owned(request_id: int, telegram_user_id: int, reason: str) -> 
     row = get_request(request_id)
     if not row or int(row.get("telegram_user_id") or 0) != telegram_user_id:
         return "not_found", None
-    if row.get("status") not in ACTIVE_REQUEST_STATUSES:
+    if row.get("status") not in MANAGEABLE_REQUEST_STATUSES:
         return "closed", row
     if reason == "bought" and row.get("request_type") != "buyer":
         return "not_found", None
@@ -927,7 +937,7 @@ def close_request_owned(request_id: int, telegram_user_id: int, reason: str) -> 
         .update({"status": status, "close_reason": reason, "closed_at": now})
         .eq("id", request_id)
         .eq("telegram_user_id", telegram_user_id)
-        .in_("status", ["new", "in_progress"])
+        .in_("status", ["new", "in_progress", "paused"])
         .execute()
         .data
         or []
@@ -941,6 +951,54 @@ def close_request_owned(request_id: int, telegram_user_id: int, reason: str) -> 
         supabase.table("leads").update({"status": lead_status}).eq("id", int(updated["radar_lead_id"])).execute()
     return "ok", updated
 
+
+
+def set_request_paused_owned(request_id: int, telegram_user_id: int, pause: bool) -> tuple[str, dict[str, Any] | None]:
+    row = get_request(request_id)
+    if not row or int(row.get("telegram_user_id") or 0) != telegram_user_id:
+        return "not_found", None
+
+    current = str(row.get("status") or "")
+    if pause:
+        if current == "paused":
+            return "already", row
+        if current not in MATCHING_REQUEST_STATUSES:
+            return "closed", row
+        rows = (
+            supabase.table("market_requests")
+            .update({"status": "paused"})
+            .eq("id", request_id)
+            .eq("telegram_user_id", telegram_user_id)
+            .in_("status", ["new", "in_progress"])
+            .execute()
+            .data
+            or []
+        )
+        if not rows:
+            return "not_found", None
+        updated = rows[0]
+        expire_matches_for_request(request_id)
+        return "ok", updated
+
+    if current in MATCHING_REQUEST_STATUSES:
+        return "already", row
+    if current != "paused":
+        return "closed", row
+    rows = (
+        supabase.table("market_requests")
+        .update({"status": "new"})
+        .eq("id", request_id)
+        .eq("telegram_user_id", telegram_user_id)
+        .eq("status", "paused")
+        .execute()
+        .data
+        or []
+    )
+    if not rows:
+        return "not_found", None
+    updated = rows[0]
+    create_matches_for_request(updated)
+    return "ok", updated
 
 def offer_keyboard(match_id: int, side: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[[
@@ -1535,7 +1593,7 @@ async def request_edit_callback(callback: CallbackQuery, state: FSMContext) -> N
     if not row or int(row.get("telegram_user_id") or 0) != int(callback.from_user.id):
         await callback.answer("Заявка не найдена. Откройте «Мои заявки»", show_alert=True)
         return
-    if row.get("status") not in ACTIVE_REQUEST_STATUSES:
+    if row.get("status") not in MANAGEABLE_REQUEST_STATUSES:
         await callback.answer("Заявка уже закрыта", show_alert=True)
         return
     await state.clear()
@@ -1558,7 +1616,7 @@ async def request_field_callback(callback: CallbackQuery, state: FSMContext) -> 
     if not row or int(row.get("telegram_user_id") or 0) != int(callback.from_user.id):
         await callback.answer("Заявка не найдена. Откройте «Мои заявки»", show_alert=True)
         return
-    if row.get("status") not in ACTIVE_REQUEST_STATUSES:
+    if row.get("status") not in MANAGEABLE_REQUEST_STATUSES:
         await callback.answer("Заявка уже закрыта", show_alert=True)
         return
 
@@ -1687,6 +1745,57 @@ async def edit_request_value_handler(message: Message, state: FSMContext) -> Non
     await message.answer("✅ Заявка обновлена. Совпадения пересчитаны.", reply_markup=MAIN_KB)
     await message.answer(request_card(updated), parse_mode="HTML", reply_markup=request_actions_keyboard(updated))
 
+
+
+@dp.callback_query(F.data.startswith("reqstate:"))
+async def request_state_callback(callback: CallbackQuery, state: FSMContext) -> None:
+    if not callback.from_user:
+        return
+    try:
+        _, request_id_raw, action = callback.data.split(":", 2)
+        request_id = int(request_id_raw)
+    except Exception:
+        await callback.answer("Эта кнопка уже неактуальна", show_alert=True)
+        return
+    if action not in {"pause", "resume"}:
+        await callback.answer("Эта кнопка уже неактуальна", show_alert=True)
+        return
+    try:
+        result, row = await asyncio.to_thread(
+            set_request_paused_owned, request_id, int(callback.from_user.id), action == "pause"
+        )
+    except Exception:
+        log.exception("Failed to change request state %s", request_id)
+        await callback.answer("Не удалось изменить статус. Попробуйте ещё раз", show_alert=True)
+        return
+    if result == "not_found":
+        await callback.answer("Заявка не найдена. Откройте «Мои заявки»", show_alert=True)
+        return
+    if result == "closed":
+        await callback.answer("Заявка уже закрыта", show_alert=True)
+        return
+    if result == "already":
+        await callback.answer("Статус уже установлен", show_alert=True)
+        return
+
+    await state.clear()
+    await callback.answer("Готово")
+    if callback.message and row:
+        await callback.message.edit_text(
+            request_card(row),
+            parse_mode="HTML",
+            reply_markup=request_actions_keyboard(row),
+        )
+        if action == "pause":
+            await callback.message.answer(
+                "⏸ Заявка приостановлена. Она временно не участвует в подборе.",
+                reply_markup=MAIN_KB,
+            )
+        else:
+            await callback.message.answer(
+                "▶️ Заявка снова активна и участвует в подборе.",
+                reply_markup=MAIN_KB,
+            )
 
 @dp.callback_query(F.data.startswith("reqclose:"))
 async def request_close_callback(callback: CallbackQuery, state: FSMContext) -> None:
