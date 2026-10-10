@@ -175,14 +175,9 @@ class EditRequestForm(StatesGroup):
     value = State()
 
 
-MAIN_KB = ReplyKeyboardMarkup(
-    keyboard=[
-        [KeyboardButton(text="🚗 Хочу купить авто")],
-        [KeyboardButton(text="💰 Хочу продать авто")],
-        [KeyboardButton(text="📋 Мои заявки")],
-    ],
-    resize_keyboard=True,
-)
+# Compatibility alias: old reply-keyboard menu is no longer shown.
+# Wherever legacy code removes a form keyboard, this explicitly hides it.
+MAIN_KB = ReplyKeyboardRemove()
 
 
 START_TEXT = (
@@ -198,6 +193,7 @@ START_INLINE_KB = InlineKeyboardMarkup(
         [InlineKeyboardButton(text="🔎 Купить авто", callback_data="start:buy")],
         [InlineKeyboardButton(text="🚘 Продать авто", callback_data="start:sell")],
         [InlineKeyboardButton(text="📋 Мои заявки", callback_data="start:my")],
+        [InlineKeyboardButton(text="❓ Помощь", callback_data="start:help")],
     ]
 )
 
@@ -1460,9 +1456,19 @@ def backfill_seller_radar_leads(limit: int = 50) -> None:
             log.exception("Could not backfill seller request %s", row.get("id"))
 
 
+async def clear_bottom_keyboard(message: Message) -> None:
+    """Remove any old Telegram reply keyboard before showing inline navigation."""
+    try:
+        notice = await message.answer("Меню обновлено.", reply_markup=ReplyKeyboardRemove())
+        await notice.delete()
+    except Exception:
+        pass
+
+
 @dp.message(CommandStart())
 async def start_handler(message: Message, state: FSMContext) -> None:
     await state.clear()
+    await clear_bottom_keyboard(message)
     if os.path.exists(START_BANNER_PATH):
         await message.answer_photo(
             FSInputFile(START_BANNER_PATH),
@@ -1502,9 +1508,9 @@ async def start_my_callback(callback: CallbackQuery, state: FSMContext) -> None:
     if not callback.message:
         return
     if not rows:
-        await callback.message.answer("У вас пока нет заявок.", reply_markup=MAIN_KB)
+        await callback.message.answer("У вас пока нет заявок.", reply_markup=START_INLINE_KB)
         return
-    await callback.message.answer("📋 <b>Ваши последние заявки</b>", parse_mode="HTML", reply_markup=MAIN_KB)
+    await callback.message.answer("📋 <b>Ваши последние заявки</b>", parse_mode="HTML", reply_markup=START_INLINE_KB)
     for row in rows:
         await callback.message.answer(
             request_card(row),
@@ -1513,16 +1519,26 @@ async def start_my_callback(callback: CallbackQuery, state: FSMContext) -> None:
         )
 
 
+@dp.callback_query(F.data == "start:help")
+async def start_help_callback(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    await callback.answer()
+    if callback.message:
+        await callback.message.answer(HELP_TEXT, parse_mode="HTML", reply_markup=START_INLINE_KB)
+
+
 @dp.message(Command("help"))
 async def help_handler(message: Message, state: FSMContext) -> None:
     await state.clear()
+    await clear_bottom_keyboard(message)
     await message.answer(HELP_TEXT, parse_mode="HTML", reply_markup=START_INLINE_KB)
 
 
 @dp.message(Command("cancel"))
 async def cancel_handler(message: Message, state: FSMContext) -> None:
     await state.clear()
-    await message.answer("❌ Действие отменено. Выберите следующий шаг:", reply_markup=MAIN_KB)
+    await clear_bottom_keyboard(message)
+    await message.answer("❌ Действие отменено. Выберите следующий шаг:", reply_markup=START_INLINE_KB)
 
 
 @dp.message(Command("sell"))
@@ -1541,9 +1557,9 @@ async def my_command_handler(message: Message, state: FSMContext) -> None:
         return
     rows = await asyncio.to_thread(get_user_requests, int(message.from_user.id))
     if not rows:
-        await message.answer("У вас пока нет заявок.", reply_markup=MAIN_KB)
+        await message.answer("У вас пока нет заявок.", reply_markup=START_INLINE_KB)
         return
-    await message.answer("📋 <b>Ваши последние заявки</b>", parse_mode="HTML", reply_markup=MAIN_KB)
+    await message.answer("📋 <b>Ваши последние заявки</b>", parse_mode="HTML", reply_markup=START_INLINE_KB)
     for row in rows:
         await message.answer(
             request_card(row),
@@ -1680,14 +1696,14 @@ async def buyer_contact(message: Message, state: FSMContext) -> None:
         row = await asyncio.to_thread(save_market_request, payload)
     except Exception:
         log.exception("Failed to save buyer request")
-        await message.answer("⚠️ Не удалось сохранить заявку. Попробуйте ещё раз через минуту.", reply_markup=MAIN_KB)
+        await message.answer("⚠️ Не удалось сохранить заявку. Попробуйте ещё раз через минуту.", reply_markup=START_INLINE_KB)
         await state.clear()
         return
     if row.get("_is_duplicate"):
         await state.clear()
         await message.answer(
             f"ℹ️ Такая активная заявка уже есть: №{row['id']}.",
-            reply_markup=MAIN_KB,
+            reply_markup=START_INLINE_KB,
         )
         return
     row.pop("_is_duplicate", None)
@@ -1703,7 +1719,7 @@ async def buyer_contact(message: Message, state: FSMContext) -> None:
     await message.answer(
         f"✅ Заявка #{row['id']} принята.\n\n"
         "Мы зафиксировали, какой автомобиль вы ищете. Когда появится подходящий вариант, с вами можно будет связаться по указанному контакту.",
-        reply_markup=MAIN_KB,
+        reply_markup=START_INLINE_KB,
     )
 
 
@@ -1714,9 +1730,9 @@ async def my_requests_handler(message: Message, state: FSMContext) -> None:
         return
     rows = await asyncio.to_thread(get_user_requests, int(message.from_user.id))
     if not rows:
-        await message.answer("У вас пока нет заявок.", reply_markup=MAIN_KB)
+        await message.answer("У вас пока нет заявок.", reply_markup=START_INLINE_KB)
         return
-    await message.answer("📋 <b>Ваши последние заявки</b>", parse_mode="HTML", reply_markup=MAIN_KB)
+    await message.answer("📋 <b>Ваши последние заявки</b>", parse_mode="HTML", reply_markup=START_INLINE_KB)
     for row in rows:
         await message.answer(
             request_card(row),
@@ -1818,7 +1834,7 @@ async def edit_request_value_handler(message: Message, state: FSMContext) -> Non
     row = await asyncio.to_thread(get_request, request_id)
     if not row or int(row.get("telegram_user_id") or 0) != int(message.from_user.id):
         await state.clear()
-        await message.answer("Заявка не найдена. Откройте «Мои заявки».", reply_markup=MAIN_KB)
+        await message.answer("Заявка не найдена. Откройте «Мои заявки».", reply_markup=START_INLINE_KB)
         return
 
     text = (message.text or "").strip()
@@ -1886,26 +1902,26 @@ async def edit_request_value_handler(message: Message, state: FSMContext) -> Non
             updates["contact_phone"] = None
     else:
         await state.clear()
-        await message.answer("Не удалось открыть редактирование. Попробуйте ещё раз.", reply_markup=MAIN_KB)
+        await message.answer("Не удалось открыть редактирование. Попробуйте ещё раз.", reply_markup=START_INLINE_KB)
         return
 
     try:
         result, updated = await asyncio.to_thread(update_request_owned, request_id, int(message.from_user.id), updates)
     except Exception:
         log.exception("Failed to edit market request %s", request_id)
-        await message.answer("⚠️ Не удалось изменить заявку. Попробуйте ещё раз через минуту.", reply_markup=MAIN_KB)
+        await message.answer("⚠️ Не удалось изменить заявку. Попробуйте ещё раз через минуту.", reply_markup=START_INLINE_KB)
         await state.clear()
         return
 
     if result == "duplicate":
         await message.answer(
             f"ℹ️ После этого изменения заявка станет копией активной заявки №{updated['id']}. Изменение не сохранено.",
-            reply_markup=MAIN_KB,
+            reply_markup=START_INLINE_KB,
         )
         await state.clear()
         return
     if result != "ok" or not updated:
-        await message.answer("Эта заявка уже закрыта.", reply_markup=MAIN_KB)
+        await message.answer("Эта заявка уже закрыта.", reply_markup=START_INLINE_KB)
         await state.clear()
         return
 
@@ -1917,7 +1933,7 @@ async def edit_request_value_handler(message: Message, state: FSMContext) -> Non
         success_text = "✅ Заявка обновлена. Совпадения пересчитаны."
     else:
         success_text = "✅ Заявка обновлена. Текущие совпадения сохранены."
-    await message.answer(success_text, reply_markup=MAIN_KB)
+    await message.answer(success_text, reply_markup=START_INLINE_KB)
     await message.answer(request_card(updated), parse_mode="HTML", reply_markup=request_actions_keyboard(updated))
 
 
@@ -1964,12 +1980,12 @@ async def request_state_callback(callback: CallbackQuery, state: FSMContext) -> 
         if action == "pause":
             await callback.message.answer(
                 "⏸ Заявка приостановлена. Она временно не участвует в подборе.",
-                reply_markup=MAIN_KB,
+                reply_markup=START_INLINE_KB,
             )
         else:
             await callback.message.answer(
                 "▶️ Заявка снова активна и участвует в подборе.",
-                reply_markup=MAIN_KB,
+                reply_markup=START_INLINE_KB,
             )
 
 @dp.callback_query(F.data.startswith("reqclose:"))
@@ -2000,7 +2016,7 @@ async def request_close_callback(callback: CallbackQuery, state: FSMContext) -> 
     await callback.answer("Готово")
     if callback.message and row:
         await callback.message.edit_text(request_card(row), parse_mode="HTML", reply_markup=None)
-        await callback.message.answer(labels[reason], reply_markup=MAIN_KB)
+        await callback.message.answer(labels[reason], reply_markup=START_INLINE_KB)
 
 
 @dp.message(F.text == "💰 Хочу продать авто")
@@ -2262,14 +2278,14 @@ async def seller_contact(message: Message, state: FSMContext) -> None:
         row = await asyncio.to_thread(save_market_request, payload)
     except Exception:
         log.exception("Failed to save seller request")
-        await message.answer("⚠️ Не удалось сохранить заявку. Попробуйте ещё раз через минуту.", reply_markup=MAIN_KB)
+        await message.answer("⚠️ Не удалось сохранить заявку. Попробуйте ещё раз через минуту.", reply_markup=START_INLINE_KB)
         await state.clear()
         return
     if row.get("_is_duplicate"):
         await state.clear()
         await message.answer(
             f"ℹ️ Такая активная заявка уже есть: №{row['id']}.",
-            reply_markup=MAIN_KB,
+            reply_markup=START_INLINE_KB,
         )
         return
     row.pop("_is_duplicate", None)
@@ -2285,7 +2301,7 @@ async def seller_contact(message: Message, state: FSMContext) -> None:
     await message.answer(
         f"✅ Заявка #{row['id']} принята.\n\n"
         "Автомобиль сохранён и участвует в подборе покупателей. Если найдётся подходящий запрос, вы получите предложение здесь.",
-        reply_markup=MAIN_KB,
+        reply_markup=START_INLINE_KB,
     )
 
 
@@ -2364,7 +2380,8 @@ async def match_decline_callback(callback: CallbackQuery) -> None:
 
 @dp.message()
 async def fallback(message: Message) -> None:
-    await message.answer("Выберите действие в меню ниже 👇", reply_markup=MAIN_KB)
+    await clear_bottom_keyboard(message)
+    await message.answer("Выберите действие:", reply_markup=START_INLINE_KB)
 
 
 async def main() -> None:
