@@ -745,18 +745,19 @@ def request_card(row: dict[str, Any]) -> str:
         body.extend([
             f"💰 Бюджет: {esc(format_rub(row.get('budget')))}",
             f"📅 Год: {esc(row.get('min_vehicle_year'))}–{esc(row.get('max_vehicle_year'))}",
-            f"🛣 Максимальный пробег: {esc(row.get('max_mileage_km'))} км",
+            f"🛣 Максимальный пробег: {esc(format_number(row.get('max_mileage_km')))} км",
             f"📝 Требования: {esc(row.get('requirements') or 'нет')}",
         ])
     else:
         body.extend([
             f"📅 Год: {esc(row.get('vehicle_year'))}",
             f"💰 Цена: {esc(format_rub(row.get('asking_price')))}",
-            f"🛣 Пробег: {esc(row.get('mileage_km'))} км",
+            f"🛣 Пробег: {esc(format_number(row.get('mileage_km')))} км",
             f"⚙️ Комплектация: {esc(row.get('vehicle_trim') or 'не указана')}",
-            f"📝 Описание: {esc(row.get('seller_description') or 'нет')}",
-            f"📷 Фото: {seller_photo_count(row) if seller_photo_count(row) else 'нет'}",
         ])
+        if row.get("seller_description"):
+            body.append(f"📝 Описание: {esc(row.get('seller_description'))}")
+        body.append(f"📷 Фото: {seller_photo_count(row) if seller_photo_count(row) else 'нет'}")
     return "\n".join(body)
 
 
@@ -1295,7 +1296,7 @@ async def help_handler(message: Message, state: FSMContext) -> None:
 @dp.message(Command("cancel"))
 async def cancel_handler(message: Message, state: FSMContext) -> None:
     await state.clear()
-    await message.answer("Действие отменено. Выберите, что хотите сделать:", reply_markup=MAIN_KB)
+    await message.answer("❌ Действие отменено. Выберите следующий шаг:", reply_markup=MAIN_KB)
 
 
 @dp.message(Command("sell"))
@@ -1337,7 +1338,7 @@ async def buyer_start(message: Message, state: FSMContext) -> None:
 async def buyer_city(message: Message, state: FSMContext) -> None:
     text = (message.text or "").strip()
     if len(text) < 2:
-        await message.answer("Напишите город текстом.")
+        await message.answer("Укажите город, например: Симферополь.")
         return
     await state.update_data(city=text[:120])
     await state.set_state(BuyerForm.vehicle)
@@ -1348,7 +1349,7 @@ async def buyer_city(message: Message, state: FSMContext) -> None:
 async def buyer_vehicle(message: Message, state: FSMContext) -> None:
     text = (message.text or "").strip()
     if len(text) < 2:
-        await message.answer("Напишите марку/модель или тип автомобиля.")
+        await message.answer("Укажите автомобиль, например: Toyota Camry.")
         return
     await state.update_data(vehicle=text[:200])
     await state.set_state(BuyerForm.budget)
@@ -1359,7 +1360,7 @@ async def buyer_vehicle(message: Message, state: FSMContext) -> None:
 async def buyer_budget(message: Message, state: FSMContext) -> None:
     value = parse_money(message.text or "")
     if value is None:
-        await message.answer("Не понял бюджет. Напишите, например: 2,5 млн или 2 500 000.")
+        await message.answer("Укажите бюджет, например: 2,5 млн или 2 500 000 ₽.")
         return
     await state.update_data(budget=value)
     await state.set_state(BuyerForm.min_year)
@@ -1370,7 +1371,7 @@ async def buyer_budget(message: Message, state: FSMContext) -> None:
 async def buyer_min_year(message: Message, state: FSMContext) -> None:
     year = parse_int(message.text or "")
     if year is None or year < 1950 or year > 2035:
-        await message.answer("Напишите минимальный год четырьмя цифрами, например 2020.")
+        await message.answer("Укажите год четырьмя цифрами, например: 2020.")
         return
     await state.update_data(min_vehicle_year=year)
     await state.set_state(BuyerForm.max_year)
@@ -1383,7 +1384,7 @@ async def buyer_max_year(message: Message, state: FSMContext) -> None:
     data = await state.get_data()
     min_year = int(data.get("min_vehicle_year") or 0)
     if year is None or year < min_year or year > 2035:
-        await message.answer(f"Максимальный год должен быть не меньше {min_year}. Например: 2026.")
+        await message.answer(f"Максимальный год должен быть не меньше {min_year}.")
         return
     await state.update_data(max_vehicle_year=year)
     await state.set_state(BuyerForm.max_mileage)
@@ -1394,7 +1395,7 @@ async def buyer_max_year(message: Message, state: FSMContext) -> None:
 async def buyer_max_mileage(message: Message, state: FSMContext) -> None:
     mileage = parse_int(message.text or "")
     if mileage is None or mileage < 0 or mileage > 2_000_000:
-        await message.answer("Напишите максимальный пробег цифрами, например 100000.")
+        await message.answer("Укажите пробег цифрами, например: 100 000.")
         return
     await state.update_data(max_mileage_km=mileage)
     await state.set_state(BuyerForm.requirements)
@@ -1424,7 +1425,7 @@ async def buyer_contact(message: Message, state: FSMContext) -> None:
             telegram = f"@{message.from_user.username}"
         else:
             await message.answer(
-                "Нужен контакт. Отправьте номер кнопкой или напишите телефон / @username.",
+                "Укажите контакт: отправьте номер кнопкой или напишите @username.",
                 reply_markup=CONTACT_KB,
             )
             return
@@ -1453,13 +1454,13 @@ async def buyer_contact(message: Message, state: FSMContext) -> None:
         row = await asyncio.to_thread(save_market_request, payload)
     except Exception:
         log.exception("Failed to save buyer request")
-        await message.answer("Не удалось сохранить заявку. Попробуйте ещё раз позже.", reply_markup=MAIN_KB)
+        await message.answer("⚠️ Не удалось сохранить заявку. Попробуйте ещё раз через минуту.", reply_markup=MAIN_KB)
         await state.clear()
         return
     if row.get("_is_duplicate"):
         await state.clear()
         await message.answer(
-            f"ℹ️ Такая активная заявка уже есть — №{row['id']}. Вторую копию не создаю.",
+            f"ℹ️ Такая активная заявка уже есть: №{row['id']}.",
             reply_markup=MAIN_KB,
         )
         return
@@ -1506,11 +1507,11 @@ async def request_show_callback(callback: CallbackQuery, state: FSMContext) -> N
     try:
         request_id = int(callback.data.split(":", 1)[1])
     except Exception:
-        await callback.answer("Некорректная заявка", show_alert=True)
+        await callback.answer("Эта кнопка уже неактуальна", show_alert=True)
         return
     row = await asyncio.to_thread(get_request, request_id)
     if not row or int(row.get("telegram_user_id") or 0) != int(callback.from_user.id):
-        await callback.answer("Заявка не найдена", show_alert=True)
+        await callback.answer("Заявка не найдена. Откройте «Мои заявки»", show_alert=True)
         return
     await callback.answer()
     if callback.message:
@@ -1528,14 +1529,14 @@ async def request_edit_callback(callback: CallbackQuery, state: FSMContext) -> N
     try:
         request_id = int(callback.data.split(":", 1)[1])
     except Exception:
-        await callback.answer("Некорректная заявка", show_alert=True)
+        await callback.answer("Эта кнопка уже неактуальна", show_alert=True)
         return
     row = await asyncio.to_thread(get_request, request_id)
     if not row or int(row.get("telegram_user_id") or 0) != int(callback.from_user.id):
-        await callback.answer("Заявка не найдена", show_alert=True)
+        await callback.answer("Заявка не найдена. Откройте «Мои заявки»", show_alert=True)
         return
     if row.get("status") not in ACTIVE_REQUEST_STATUSES:
-        await callback.answer("Закрытую заявку изменить нельзя", show_alert=True)
+        await callback.answer("Заявка уже закрыта", show_alert=True)
         return
     await state.clear()
     await callback.answer("Выберите поле")
@@ -1551,21 +1552,21 @@ async def request_field_callback(callback: CallbackQuery, state: FSMContext) -> 
         _, request_id_raw, field = callback.data.split(":", 2)
         request_id = int(request_id_raw)
     except Exception:
-        await callback.answer("Некорректная команда", show_alert=True)
+        await callback.answer("Эта кнопка уже неактуальна", show_alert=True)
         return
     row = await asyncio.to_thread(get_request, request_id)
     if not row or int(row.get("telegram_user_id") or 0) != int(callback.from_user.id):
-        await callback.answer("Заявка не найдена", show_alert=True)
+        await callback.answer("Заявка не найдена. Откройте «Мои заявки»", show_alert=True)
         return
     if row.get("status") not in ACTIVE_REQUEST_STATUSES:
-        await callback.answer("Закрытую заявку изменить нельзя", show_alert=True)
+        await callback.answer("Заявка уже закрыта", show_alert=True)
         return
 
     buyer_fields = {"city", "vehicle", "budget", "min_vehicle_year", "max_vehicle_year", "max_mileage_km", "requirements", "contact"}
     seller_fields = {"city", "vehicle", "vehicle_year", "asking_price", "mileage_km", "vehicle_trim", "seller_description", "photo_file_id", "contact"}
     allowed = buyer_fields if row.get("request_type") == "buyer" else seller_fields
     if field not in allowed:
-        await callback.answer("Это поле недоступно", show_alert=True)
+        await callback.answer("Это поле нельзя изменить", show_alert=True)
         return
 
     await state.set_state(EditRequestForm.value)
@@ -1591,26 +1592,26 @@ async def edit_request_value_handler(message: Message, state: FSMContext) -> Non
     row = await asyncio.to_thread(get_request, request_id)
     if not row or int(row.get("telegram_user_id") or 0) != int(message.from_user.id):
         await state.clear()
-        await message.answer("Заявка не найдена.", reply_markup=MAIN_KB)
+        await message.answer("Заявка не найдена. Откройте «Мои заявки».", reply_markup=MAIN_KB)
         return
 
     text = (message.text or "").strip()
     updates: dict[str, Any] = {}
     if field in {"city", "vehicle"}:
         if len(text) < 2:
-            await message.answer("Слишком короткое значение. Попробуйте ещё раз.")
+            await message.answer("Введите значение полностью.")
             return
         updates[field] = text[:200 if field == "vehicle" else 120]
     elif field in {"budget", "asking_price"}:
         value = parse_money(text)
         if value is None:
-            await message.answer("Не понял сумму. Например: 2,5 млн или 2 500 000 ₽.")
+            await message.answer("Укажите сумму, например: 2,5 млн или 2 500 000 ₽.")
             return
         updates[field] = value
     elif field in {"min_vehicle_year", "max_vehicle_year", "vehicle_year"}:
         value = parse_int(text)
         if value is None or value < 1950 or value > 2035:
-            await message.answer("Введите год четырьмя цифрами, например 2020.")
+            await message.answer("Укажите год четырьмя цифрами, например: 2020.")
             return
         if field == "min_vehicle_year" and row.get("max_vehicle_year") is not None and value > int(row["max_vehicle_year"]):
             await message.answer(f"Минимальный год не может быть больше {row['max_vehicle_year']}.")
@@ -1622,7 +1623,7 @@ async def edit_request_value_handler(message: Message, state: FSMContext) -> Non
     elif field in {"max_mileage_km", "mileage_km"}:
         value = parse_int(text)
         if value is None or value < 0 or value > 2_000_000:
-            await message.answer("Введите пробег цифрами, например 100000.")
+            await message.answer("Укажите пробег цифрами, например: 100 000.")
             return
         updates[field] = value
     elif field == "requirements":
@@ -1644,12 +1645,12 @@ async def edit_request_value_handler(message: Message, state: FSMContext) -> Non
             updates["photo_file_ids"] = []
             updates["photo_unique_ids"] = []
         else:
-            await message.answer("Отправьте фотографию автомобиля или напишите «Удалить».")
+            await message.answer("Отправьте фото автомобиля или напишите «Удалить».")
             return
     elif field == "contact":
         phone, telegram = contact_from_message(message)
         if not phone and not telegram:
-            await message.answer("Отправьте номер телефона или @username.", reply_markup=CONTACT_KB)
+            await message.answer("Отправьте номер телефона или напишите @username.", reply_markup=CONTACT_KB)
             return
         if phone:
             updates["contact_phone"] = phone
@@ -1659,14 +1660,14 @@ async def edit_request_value_handler(message: Message, state: FSMContext) -> Non
             updates["contact_phone"] = None
     else:
         await state.clear()
-        await message.answer("Не удалось определить поле для изменения.", reply_markup=MAIN_KB)
+        await message.answer("Не удалось открыть редактирование. Попробуйте ещё раз.", reply_markup=MAIN_KB)
         return
 
     try:
         result, updated = await asyncio.to_thread(update_request_owned, request_id, int(message.from_user.id), updates)
     except Exception:
         log.exception("Failed to edit market request %s", request_id)
-        await message.answer("Не удалось изменить заявку. Попробуйте ещё раз позже.", reply_markup=MAIN_KB)
+        await message.answer("⚠️ Не удалось изменить заявку. Попробуйте ещё раз через минуту.", reply_markup=MAIN_KB)
         await state.clear()
         return
 
@@ -1678,7 +1679,7 @@ async def edit_request_value_handler(message: Message, state: FSMContext) -> Non
         await state.clear()
         return
     if result != "ok" or not updated:
-        await message.answer("Эту заявку уже нельзя изменить.", reply_markup=MAIN_KB)
+        await message.answer("Эта заявка уже закрыта.", reply_markup=MAIN_KB)
         await state.clear()
         return
 
@@ -1695,16 +1696,16 @@ async def request_close_callback(callback: CallbackQuery, state: FSMContext) -> 
         _, request_id_raw, reason = callback.data.split(":", 2)
         request_id = int(request_id_raw)
     except Exception:
-        await callback.answer("Некорректная команда", show_alert=True)
+        await callback.answer("Эта кнопка уже неактуальна", show_alert=True)
         return
     try:
         result, row = await asyncio.to_thread(close_request_owned, request_id, int(callback.from_user.id), reason)
     except Exception:
         log.exception("Failed to close market request %s", request_id)
-        await callback.answer("Не удалось закрыть заявку", show_alert=True)
+        await callback.answer("Не удалось закрыть заявку. Попробуйте ещё раз", show_alert=True)
         return
     if result == "not_found":
-        await callback.answer("Заявка не найдена", show_alert=True)
+        await callback.answer("Заявка не найдена. Откройте «Мои заявки»", show_alert=True)
         return
     if result == "closed":
         await callback.answer("Заявка уже закрыта", show_alert=True)
@@ -1729,7 +1730,7 @@ async def seller_start(message: Message, state: FSMContext) -> None:
 async def seller_city(message: Message, state: FSMContext) -> None:
     text = (message.text or "").strip()
     if len(text) < 2:
-        await message.answer("Напишите город текстом.")
+        await message.answer("Укажите город, например: Симферополь.")
         return
     await state.update_data(city=text[:120])
     await state.set_state(SellerForm.vehicle)
@@ -1740,7 +1741,7 @@ async def seller_city(message: Message, state: FSMContext) -> None:
 async def seller_vehicle(message: Message, state: FSMContext) -> None:
     text = (message.text or "").strip()
     if len(text) < 2:
-        await message.answer("Напишите марку и модель.")
+        await message.answer("Укажите марку и модель, например: Toyota Camry.")
         return
     await state.update_data(vehicle=text[:200])
     await state.set_state(SellerForm.year)
@@ -1762,7 +1763,7 @@ async def seller_year(message: Message, state: FSMContext) -> None:
 async def seller_price(message: Message, state: FSMContext) -> None:
     value = parse_money(message.text or "")
     if value is None:
-        await message.answer("Не понял цену. Напишите, например: 2,5 млн или 2 500 000.")
+        await message.answer("Укажите цену, например: 2,5 млн или 2 500 000 ₽.")
         return
     await state.update_data(asking_price=value)
     await state.set_state(SellerForm.mileage)
@@ -1773,7 +1774,7 @@ async def seller_price(message: Message, state: FSMContext) -> None:
 async def seller_mileage(message: Message, state: FSMContext) -> None:
     value = parse_int(message.text or "")
     if value is None or value > 2_000_000:
-        await message.answer("Напишите пробег цифрами, например 85000.")
+        await message.answer("Укажите пробег цифрами, например: 85 000.")
         return
     await state.update_data(mileage_km=value)
     await state.set_state(SellerForm.trim)
@@ -1914,7 +1915,7 @@ async def seller_photo(message: Message, state: FSMContext) -> None:
 
     if text == "✅ Готово":
         if not photo_ids:
-            await message.answer("Сначала отправьте хотя бы одно фото или нажмите «Пропустить».", reply_markup=SKIP_KB)
+            await message.answer("Добавьте хотя бы одно фото или нажмите «Пропустить».", reply_markup=SKIP_KB)
             return
         await state.update_data(photo_file_id=photo_ids[0], photo_unique_id=unique_ids[0])
     elif text == "Пропустить":
@@ -1944,7 +1945,7 @@ async def seller_contact(message: Message, state: FSMContext) -> None:
             telegram = f"@{message.from_user.username}"
         else:
             await message.answer(
-                "Нужен контакт. Отправьте номер кнопкой или напишите телефон / @username.",
+                "Укажите контакт: отправьте номер кнопкой или напишите @username.",
                 reply_markup=CONTACT_KB,
             )
             return
@@ -1977,13 +1978,13 @@ async def seller_contact(message: Message, state: FSMContext) -> None:
         row = await asyncio.to_thread(save_market_request, payload)
     except Exception:
         log.exception("Failed to save seller request")
-        await message.answer("Не удалось сохранить заявку. Попробуйте ещё раз позже.", reply_markup=MAIN_KB)
+        await message.answer("⚠️ Не удалось сохранить заявку. Попробуйте ещё раз через минуту.", reply_markup=MAIN_KB)
         await state.clear()
         return
     if row.get("_is_duplicate"):
         await state.clear()
         await message.answer(
-            f"ℹ️ Такая активная заявка уже есть — №{row['id']}. Вторую копию не создаю.",
+            f"ℹ️ Такая активная заявка уже есть: №{row['id']}.",
             reply_markup=MAIN_KB,
         )
         return
@@ -2010,20 +2011,20 @@ async def match_accept_callback(callback: CallbackQuery) -> None:
         _, match_id_raw, side = callback.data.split(":", 2)
         match_id = int(match_id_raw)
     except Exception:
-        await callback.answer("Некорректная команда", show_alert=True)
+        await callback.answer("Эта кнопка уже неактуальна", show_alert=True)
         return
 
     bundle = await asyncio.to_thread(get_match_bundle, match_id)
     if not bundle:
-        await callback.answer("Совпадение уже недоступно", show_alert=True)
+        await callback.answer("Это предложение уже неактуально", show_alert=True)
         return
     match, buyer, seller = bundle
     if match.get("status") not in {"approved", "offered"}:
-        await callback.answer("Это совпадение уже закрыто", show_alert=True)
+        await callback.answer("Это предложение уже закрыто", show_alert=True)
         return
     request_row = buyer if side == "buyer" else seller
     if not callback.from_user or int(request_row["telegram_user_id"]) != int(callback.from_user.id):
-        await callback.answer("Эта кнопка предназначена другой стороне", show_alert=True)
+        await callback.answer("Эта кнопка доступна другому участнику", show_alert=True)
         return
 
     field = "buyer_decision" if side == "buyer" else "seller_decision"
@@ -2048,20 +2049,20 @@ async def match_decline_callback(callback: CallbackQuery) -> None:
         _, match_id_raw, side = callback.data.split(":", 2)
         match_id = int(match_id_raw)
     except Exception:
-        await callback.answer("Некорректная команда", show_alert=True)
+        await callback.answer("Эта кнопка уже неактуальна", show_alert=True)
         return
 
     bundle = await asyncio.to_thread(get_match_bundle, match_id)
     if not bundle:
-        await callback.answer("Совпадение уже недоступно", show_alert=True)
+        await callback.answer("Это предложение уже неактуально", show_alert=True)
         return
     match, buyer, seller = bundle
     if match.get("status") not in {"approved", "offered"}:
-        await callback.answer("Это совпадение уже закрыто", show_alert=True)
+        await callback.answer("Это предложение уже закрыто", show_alert=True)
         return
     request_row = buyer if side == "buyer" else seller
     if not callback.from_user or int(request_row["telegram_user_id"]) != int(callback.from_user.id):
-        await callback.answer("Эта кнопка предназначена другой стороне", show_alert=True)
+        await callback.answer("Эта кнопка доступна другому участнику", show_alert=True)
         return
 
     field = "buyer_decision" if side == "buyer" else "seller_decision"
@@ -2079,7 +2080,7 @@ async def match_decline_callback(callback: CallbackQuery) -> None:
 
 @dp.message()
 async def fallback(message: Message) -> None:
-    await message.answer("Выберите действие кнопкой ниже:", reply_markup=MAIN_KB)
+    await message.answer("Выберите действие в меню ниже 👇", reply_markup=MAIN_KB)
 
 
 async def main() -> None:
