@@ -7,13 +7,13 @@ import os
 import re
 from datetime import datetime, timezone
 from difflib import SequenceMatcher
-from typing import Any
+from typing import Any, Mapping
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.fsm.storage.base import BaseStorage, StateType, StorageKey
 from aiogram.types import (
     BotCommand,
     CallbackQuery,
@@ -49,8 +49,102 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 log = logging.getLogger("kuplyu-prodam-auto")
 
 bot = Bot(BOT_TOKEN)
-dp = Dispatcher(storage=MemoryStorage())
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_SECRET_KEY)
+
+
+class SupabaseFSMStorage(BaseStorage):
+    """Persistent aiogram FSM storage backed by Supabase.
+
+    This keeps unfinished buyer/seller/edit forms across Railway restarts.
+    """
+
+    def __init__(self, client: Client) -> None:
+        self.client = client
+
+    @staticmethod
+    def _storage_key(key: StorageKey) -> str:
+        # Keep compatibility with different aiogram 3.x StorageKey versions.
+        parts = [
+            getattr(key, "bot_id", None),
+            getattr(key, "chat_id", None),
+            getattr(key, "user_id", None),
+            getattr(key, "thread_id", None),
+            getattr(key, "business_connection_id", None),
+            getattr(key, "destiny", "default"),
+        ]
+        return json.dumps(parts, ensure_ascii=False, separators=(",", ":"))
+
+    def _set_state_sync(self, storage_key: str, state: str | None) -> None:
+        self.client.table("telegram_fsm_storage").upsert(
+            {
+                "storage_key": storage_key,
+                "state": state,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            },
+            on_conflict="storage_key",
+        ).execute()
+
+    def _get_state_sync(self, storage_key: str) -> str | None:
+        rows = (
+            self.client.table("telegram_fsm_storage")
+            .select("state")
+            .eq("storage_key", storage_key)
+            .limit(1)
+            .execute()
+            .data
+            or []
+        )
+        return str(rows[0]["state"]) if rows and rows[0].get("state") else None
+
+    def _set_data_sync(self, storage_key: str, data: dict[str, Any]) -> None:
+        self.client.table("telegram_fsm_storage").upsert(
+            {
+                "storage_key": storage_key,
+                "data": data,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            },
+            on_conflict="storage_key",
+        ).execute()
+
+    def _get_data_sync(self, storage_key: str) -> dict[str, Any]:
+        rows = (
+            self.client.table("telegram_fsm_storage")
+            .select("data")
+            .eq("storage_key", storage_key)
+            .limit(1)
+            .execute()
+            .data
+            or []
+        )
+        value = rows[0].get("data") if rows else None
+        if isinstance(value, dict):
+            return dict(value)
+        if isinstance(value, str):
+            try:
+                decoded = json.loads(value)
+                return dict(decoded) if isinstance(decoded, dict) else {}
+            except Exception:
+                return {}
+        return {}
+
+    async def set_state(self, key: StorageKey, state: StateType = None) -> None:
+        value = state.state if isinstance(state, State) else state
+        await asyncio.to_thread(self._set_state_sync, self._storage_key(key), value)
+
+    async def get_state(self, key: StorageKey) -> str | None:
+        return await asyncio.to_thread(self._get_state_sync, self._storage_key(key))
+
+    async def set_data(self, key: StorageKey, data: Mapping[str, Any]) -> None:
+        await asyncio.to_thread(self._set_data_sync, self._storage_key(key), dict(data))
+
+    async def get_data(self, key: StorageKey) -> dict[str, Any]:
+        return await asyncio.to_thread(self._get_data_sync, self._storage_key(key))
+
+    async def close(self) -> None:
+        return None
+
+
+dp = Dispatcher(storage=SupabaseFSMStorage(supabase))
 
 
 class BuyerForm(StatesGroup):
@@ -1754,7 +1848,14 @@ async def edit_request_value_handler(message: Message, state: FSMContext) -> Non
         return
 
     await state.clear()
-    await message.answer("✅ Заявка обновлена. Совпадения пересчитаны.", reply_markup=MAIN_KB)
+    buyer_matching_fields = {"city", "vehicle", "budget", "min_vehicle_year", "max_vehicle_year", "max_mileage_km"}
+    seller_matching_fields = {"city", "vehicle", "vehicle_year", "asking_price", "mileage_km"}
+    matching_fields = buyer_matching_fields if row.get("request_type") == "buyer" else seller_matching_fields
+    if field in matching_fields and row.get("status") in MATCHING_REQUEST_STATUSES:
+        success_text = "✅ Заявка обновлена. Совпадения пересчитаны."
+    else:
+        success_text = "✅ Заявка обновлена. Текущие совпадения сохранены."
+    await message.answer(success_text, reply_markup=MAIN_KB)
     await message.answer(request_card(updated), parse_mode="HTML", reply_markup=request_actions_keyboard(updated))
 
 
@@ -2208,10 +2309,16 @@ async def main() -> None:
     log.info("Starting public auto bot @%s", PUBLIC_BOT_USERNAME)
     try:
         await bot.set_my_commands(BOT_COMMANDS)
-        await bot.set_my_short_description("AutoClick — заявки на покупку и продажу авто. Совпадения по параметрам, контакты после взаимного интереса.")
+        await bot.set_my_short_description(
+            "AutoClick Market — покупка и продажа авто через умные совпадения заявок."
+        )
         await bot.set_my_description(
-            "AutoClick помогает покупателям и продавцам автомобилей находить друг друга по марке, бюджету, году и пробегу. "
-            "Оставьте заявку бесплатно. Контакты не публикуются и открываются только после взаимного подтверждения интереса."
+            "🚘 AutoClick Market — сервис для покупки и продажи автомобилей через Telegram.\n\n"
+            "🔎 Покупатель оставляет запрос: автомобиль, бюджет, год, пробег и пожелания.\n"
+            "💰 Продавец добавляет авто, цену, описание и до 5 фотографий.\n\n"
+            "AutoClick сопоставляет заявки и показывает подходящие варианты.\n\n"
+            "🔒 Контакты открываются только после взаимного подтверждения интереса.\n\n"
+            "Один запрос — больше выбора."
         )
     except Exception:
         log.exception("Could not update public bot profile/commands")
