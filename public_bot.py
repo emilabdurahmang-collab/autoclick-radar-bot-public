@@ -109,7 +109,7 @@ HELP_TEXT = (
     "3️⃣ При подходящем совпадении обе стороны получат предложение.\n"
     "4️⃣ Контакты откроются только после подтверждения интереса обеими сторонами.\n\n"
     "Ваш телефон не публикуется открыто. Заявку можно изменить или закрыть через «📋 Мои заявки».\n\n"
-    "Команды: /buy — купить, /sell — продать, /my — мои заявки, /help — помощь."
+    "Команды: /buy — купить, /sell — продать, /my — мои заявки, /help — помощь, /cancel — отмена."
 )
 
 BOT_COMMANDS = [
@@ -1298,6 +1298,33 @@ async def cancel_handler(message: Message, state: FSMContext) -> None:
     await message.answer("Действие отменено. Выберите, что хотите сделать:", reply_markup=MAIN_KB)
 
 
+@dp.message(Command("sell"))
+async def sell_command_handler(message: Message, state: FSMContext) -> None:
+    # Commands must work even if the user is in the middle of another form.
+    await state.clear()
+    await state.set_state(SellerForm.city)
+    await message.answer("В каком городе находится автомобиль?", reply_markup=ReplyKeyboardRemove())
+
+
+@dp.message(Command("my"))
+async def my_command_handler(message: Message, state: FSMContext) -> None:
+    # /my should always interrupt the current form and open saved requests.
+    await state.clear()
+    if not message.from_user:
+        return
+    rows = await asyncio.to_thread(get_user_requests, int(message.from_user.id))
+    if not rows:
+        await message.answer("У вас пока нет заявок.", reply_markup=MAIN_KB)
+        return
+    await message.answer("📋 <b>Ваши последние заявки</b>", parse_mode="HTML", reply_markup=MAIN_KB)
+    for row in rows:
+        await message.answer(
+            request_card(row),
+            parse_mode="HTML",
+            reply_markup=request_actions_keyboard(row),
+        )
+
+
 @dp.message(Command("buy"))
 @dp.message(F.text == "🚗 Хочу купить авто")
 async def buyer_start(message: Message, state: FSMContext) -> None:
@@ -1453,8 +1480,6 @@ async def buyer_contact(message: Message, state: FSMContext) -> None:
     )
 
 
-@dp.message(Command("my"))
-@dp.message(Command("my"))
 @dp.message(F.text == "📋 Мои заявки")
 async def my_requests_handler(message: Message, state: FSMContext) -> None:
     await state.clear()
@@ -1693,7 +1718,6 @@ async def request_close_callback(callback: CallbackQuery, state: FSMContext) -> 
         await callback.message.answer(labels[reason], reply_markup=MAIN_KB)
 
 
-@dp.message(Command("sell"))
 @dp.message(F.text == "💰 Хочу продать авто")
 async def seller_start(message: Message, state: FSMContext) -> None:
     await state.clear()
