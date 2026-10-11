@@ -292,6 +292,95 @@ def user_identity(message: Message) -> dict[str, Any]:
     }
 
 
+def normalize_traffic_source(value: Any) -> str:
+    """Normalize Telegram deep-link attribution code to a safe compact label."""
+    text = str(value or "").strip().lower()
+    text = re.sub(r"[^a-z0-9_-]+", "_", text).strip("_")
+    return (text[:64] or "direct")
+
+
+def start_traffic_source(message: Message) -> str:
+    """Read /start payload from links like ?start=tg_group_1."""
+    text = (message.text or "").strip()
+    parts = text.split(maxsplit=1)
+    if len(parts) == 2 and parts[0].split("@", 1)[0].lower() == "/start":
+        return normalize_traffic_source(parts[1])
+    return "direct"
+
+
+def latest_traffic_source(telegram_user_id: int) -> str:
+    rows = (
+        supabase.table("analytics_events")
+        .select("traffic_source")
+        .eq("telegram_user_id", int(telegram_user_id))
+        .eq("event_type", "bot_start")
+        .order("created_at", desc=True)
+        .limit(1)
+        .execute()
+        .data
+        or []
+    )
+    if not rows:
+        return "direct"
+    return normalize_traffic_source(rows[0].get("traffic_source"))
+
+
+async def resolve_traffic_source(state: FSMContext, telegram_user_id: int) -> str:
+    data = await state.get_data()
+    if data.get("traffic_source"):
+        return normalize_traffic_source(data.get("traffic_source"))
+    try:
+        source = await asyncio.to_thread(latest_traffic_source, int(telegram_user_id))
+    except Exception:
+        log.exception("Could not resolve traffic source for user %s", telegram_user_id)
+        source = "direct"
+    await state.update_data(traffic_source=source)
+    return source
+
+
+def record_analytics_event(
+    event_type: str,
+    telegram_user_id: int,
+    traffic_source: str,
+    request_type: str | None = None,
+    request_id: int | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> None:
+    supabase.table("analytics_events").insert(
+        {
+            "event_type": event_type,
+            "telegram_user_id": int(telegram_user_id),
+            "request_type": request_type,
+            "request_id": request_id,
+            "traffic_source": normalize_traffic_source(traffic_source),
+            "metadata": metadata or {},
+        }
+    ).execute()
+
+
+async def safe_record_analytics_event(
+    event_type: str,
+    telegram_user_id: int,
+    traffic_source: str,
+    request_type: str | None = None,
+    request_id: int | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> None:
+    try:
+        await asyncio.to_thread(
+            record_analytics_event,
+            event_type,
+            telegram_user_id,
+            traffic_source,
+            request_type,
+            request_id,
+            metadata,
+        )
+    except Exception:
+        # Analytics must never block the buyer/seller flow.
+        log.exception("Could not record analytics event %s", event_type)
+
+
 def contact_from_message(message: Message) -> tuple[str | None, str | None]:
     phone = message.contact.phone_number if message.contact else None
     username = None
@@ -1457,7 +1546,16 @@ async def clear_bottom_keyboard(message: Message) -> None:
 
 @dp.message(CommandStart())
 async def start_handler(message: Message, state: FSMContext) -> None:
+    source = start_traffic_source(message)
     await state.clear()
+    await state.update_data(traffic_source=source)
+    if message.from_user:
+        await safe_record_analytics_event(
+            "bot_start",
+            int(message.from_user.id),
+            source,
+            metadata={"start_parameter": source if source != "direct" else None},
+        )
     await clear_bottom_keyboard(message)
     if os.path.exists(START_BANNER_PATH):
         await message.answer_photo(
@@ -1472,8 +1570,13 @@ async def start_handler(message: Message, state: FSMContext) -> None:
 
 @dp.callback_query(F.data == "start:buy")
 async def start_buy_callback(callback: CallbackQuery, state: FSMContext) -> None:
+    user_id = int(callback.from_user.id) if callback.from_user else 0
+    source = await resolve_traffic_source(state, user_id) if user_id else "direct"
     await state.clear()
+    await state.update_data(traffic_source=source)
     await state.set_state(BuyerForm.city)
+    if user_id:
+        await safe_record_analytics_event("form_started", user_id, source, request_type="buyer")
     await callback.answer()
     if callback.message:
         await callback.message.answer("В каком городе ищете автомобиль?", reply_markup=ReplyKeyboardRemove())
@@ -1481,8 +1584,13 @@ async def start_buy_callback(callback: CallbackQuery, state: FSMContext) -> None
 
 @dp.callback_query(F.data == "start:sell")
 async def start_sell_callback(callback: CallbackQuery, state: FSMContext) -> None:
+    user_id = int(callback.from_user.id) if callback.from_user else 0
+    source = await resolve_traffic_source(state, user_id) if user_id else "direct"
     await state.clear()
+    await state.update_data(traffic_source=source)
     await state.set_state(SellerForm.city)
+    if user_id:
+        await safe_record_analytics_event("form_started", user_id, source, request_type="seller")
     await callback.answer()
     if callback.message:
         await callback.message.answer("В каком городе находится автомобиль?", reply_markup=ReplyKeyboardRemove())
@@ -1534,8 +1642,13 @@ async def cancel_handler(message: Message, state: FSMContext) -> None:
 @dp.message(Command("sell"))
 async def sell_command_handler(message: Message, state: FSMContext) -> None:
     # Commands must work even if the user is in the middle of another form.
+    user_id = int(message.from_user.id) if message.from_user else 0
+    source = await resolve_traffic_source(state, user_id) if user_id else "direct"
     await state.clear()
+    await state.update_data(traffic_source=source)
     await state.set_state(SellerForm.city)
+    if user_id:
+        await safe_record_analytics_event("form_started", user_id, source, request_type="seller")
     await message.answer("В каком городе находится автомобиль?", reply_markup=ReplyKeyboardRemove())
 
 
@@ -1561,8 +1674,13 @@ async def my_command_handler(message: Message, state: FSMContext) -> None:
 @dp.message(Command("buy"))
 @dp.message(F.text == "🚗 Хочу купить авто")
 async def buyer_start(message: Message, state: FSMContext) -> None:
+    user_id = int(message.from_user.id) if message.from_user else 0
+    source = await resolve_traffic_source(state, user_id) if user_id else "direct"
     await state.clear()
+    await state.update_data(traffic_source=source)
     await state.set_state(BuyerForm.city)
+    if user_id:
+        await safe_record_analytics_event("form_started", user_id, source, request_type="buyer")
     await message.answer("В каком городе ищете автомобиль?", reply_markup=ReplyKeyboardRemove())
 
 
@@ -1680,8 +1798,18 @@ async def buyer_contact(message: Message, state: FSMContext) -> None:
         "contact_telegram": telegram or ident["contact_telegram"],
         "status": "new",
         "source": "telegram_public_bot",
-        "raw_data": {"bot_username": PUBLIC_BOT_USERNAME},
+        "traffic_source": normalize_traffic_source(data.get("traffic_source")),
+        "raw_data": {
+            "bot_username": PUBLIC_BOT_USERNAME,
+            "traffic_source": normalize_traffic_source(data.get("traffic_source")),
+        },
     }
+    await safe_record_analytics_event(
+        "form_completed",
+        int(ident["telegram_user_id"]),
+        payload["traffic_source"],
+        request_type="buyer",
+    )
     try:
         row = await asyncio.to_thread(save_market_request, payload)
     except Exception:
@@ -1697,6 +1825,13 @@ async def buyer_contact(message: Message, state: FSMContext) -> None:
         )
         return
     row.pop("_is_duplicate", None)
+    await safe_record_analytics_event(
+        "request_created",
+        int(ident["telegram_user_id"]),
+        payload["traffic_source"],
+        request_type="buyer",
+        request_id=int(row["id"]),
+    )
     try:
         await asyncio.to_thread(save_buyer_as_lead, row, message)
     except Exception:
@@ -2011,8 +2146,13 @@ async def request_close_callback(callback: CallbackQuery, state: FSMContext) -> 
 
 @dp.message(F.text == "💰 Хочу продать авто")
 async def seller_start(message: Message, state: FSMContext) -> None:
+    user_id = int(message.from_user.id) if message.from_user else 0
+    source = await resolve_traffic_source(state, user_id) if user_id else "direct"
     await state.clear()
+    await state.update_data(traffic_source=source)
     await state.set_state(SellerForm.city)
+    if user_id:
+        await safe_record_analytics_event("form_started", user_id, source, request_type="seller")
     await message.answer("В каком городе находится автомобиль?", reply_markup=ReplyKeyboardRemove())
 
 
@@ -2262,8 +2402,18 @@ async def seller_contact(message: Message, state: FSMContext) -> None:
         "contact_telegram": telegram or ident["contact_telegram"],
         "status": "new",
         "source": "telegram_public_bot",
-        "raw_data": {"bot_username": PUBLIC_BOT_USERNAME},
+        "traffic_source": normalize_traffic_source(data.get("traffic_source")),
+        "raw_data": {
+            "bot_username": PUBLIC_BOT_USERNAME,
+            "traffic_source": normalize_traffic_source(data.get("traffic_source")),
+        },
     }
+    await safe_record_analytics_event(
+        "form_completed",
+        int(ident["telegram_user_id"]),
+        payload["traffic_source"],
+        request_type="seller",
+    )
     try:
         row = await asyncio.to_thread(save_market_request, payload)
     except Exception:
@@ -2279,6 +2429,13 @@ async def seller_contact(message: Message, state: FSMContext) -> None:
         )
         return
     row.pop("_is_duplicate", None)
+    await safe_record_analytics_event(
+        "request_created",
+        int(ident["telegram_user_id"]),
+        payload["traffic_source"],
+        request_type="seller",
+        request_id=int(row["id"]),
+    )
     try:
         await asyncio.to_thread(save_seller_as_lead, row)
     except Exception:
