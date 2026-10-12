@@ -245,14 +245,18 @@ SELLER_ALBUM_LOCK = asyncio.Lock()
 
 def parse_money(text: str) -> int | None:
     normalized = text.lower().replace("₽", " руб ").replace(",", ".")
+    if re.search(r"[-−–]\s*\d", normalized):
+        return None
     m = re.search(r"(\d+(?:\.\d+)?)\s*млн", normalized)
     if m:
-        return int(float(m.group(1)) * 1_000_000)
+        value = int(float(m.group(1)) * 1_000_000)
+        return value if value > 0 else None
     m = re.search(r"([\d\s]{2,})\s*тыс", normalized)
     if m:
         digits = re.sub(r"\D", "", m.group(1))
         if digits:
-            return int(digits) * 1_000
+            value = int(digits) * 1_000
+            return value if value > 0 else None
     digits = re.sub(r"\D", "", normalized)
     if digits:
         value = int(digits)
@@ -264,6 +268,18 @@ def parse_money(text: str) -> int | None:
 def parse_int(text: str) -> int | None:
     digits = re.sub(r"\D", "", text)
     return int(digits) if digits else None
+
+
+def parse_mileage(text: str) -> int | None:
+    normalized = text.lower().replace("\u00a0", " ").strip()
+    thousands = re.fullmatch(r"(\d+(?:[.,]\d+)?)\s*(?:тыс\.?|тысяч(?:а|и)?|[kк])\s*(?:км|km)?", normalized)
+    if thousands:
+        return int(float(thousands.group(1).replace(",", ".")) * 1000)
+    kilometres = re.fullmatch(r"(\d[\d\s]*)\s*(?:км|km)?", normalized)
+    if kilometres:
+        return int(re.sub(r"\s", "", kilometres.group(1)))
+    return None
+
 
 def seller_photo_ids(row: dict[str, Any]) -> list[str]:
     value = row.get("photo_file_ids")
@@ -1238,13 +1254,22 @@ async def send_match_offer(match: dict[str, Any], buyer: dict[str, Any], seller:
         try:
             photos = seller_photo_ids(seller)
             if len(photos) == 1:
-                await bot.send_photo(
-                    buyer_chat_id,
-                    photo=photos[0],
-                    caption=buyer_text,
-                    parse_mode="HTML",
-                    reply_markup=offer_keyboard(match_id, "buyer"),
-                )
+                if len(buyer_text) <= 1024:
+                    await bot.send_photo(
+                        buyer_chat_id,
+                        photo=photos[0],
+                        caption=buyer_text,
+                        parse_mode="HTML",
+                        reply_markup=offer_keyboard(match_id, "buyer"),
+                    )
+                else:
+                    await bot.send_photo(buyer_chat_id, photo=photos[0])
+                    await bot.send_message(
+                        buyer_chat_id,
+                        buyer_text,
+                        parse_mode="HTML",
+                        reply_markup=offer_keyboard(match_id, "buyer"),
+                    )
             elif len(photos) > 1:
                 await bot.send_media_group(
                     buyer_chat_id,
@@ -1331,6 +1356,10 @@ async def finalize_if_both_accepted(match_id: int) -> bool:
     match, buyer, seller = bundle
     if match.get("status") == "connected":
         return True
+    if match.get("status") not in {"approved", "offered"}:
+        return False
+    if buyer.get("status") not in MATCHING_REQUEST_STATUSES or seller.get("status") not in MATCHING_REQUEST_STATUSES:
+        return False
     if match.get("buyer_decision") != "accepted" or match.get("seller_decision") != "accepted":
         return False
 
@@ -1743,7 +1772,7 @@ async def buyer_max_year(message: Message, state: FSMContext) -> None:
 
 @dp.message(BuyerForm.max_mileage)
 async def buyer_max_mileage(message: Message, state: FSMContext) -> None:
-    mileage = parse_int(message.text or "")
+    mileage = parse_mileage(message.text or "")
     if mileage is None or mileage < 0 or mileage > 2_000_000:
         await message.answer("Укажите пробег цифрами, например: 100 000.")
         return
@@ -1988,7 +2017,7 @@ async def edit_request_value_handler(message: Message, state: FSMContext) -> Non
             return
         updates[field] = value
     elif field in {"max_mileage_km", "mileage_km"}:
-        value = parse_int(text)
+        value = parse_mileage(text)
         if value is None or value < 0 or value > 2_000_000:
             await message.answer("Укажите пробег цифрами, например: 100 000.")
             return
@@ -2202,7 +2231,7 @@ async def seller_price(message: Message, state: FSMContext) -> None:
 
 @dp.message(SellerForm.mileage)
 async def seller_mileage(message: Message, state: FSMContext) -> None:
-    value = parse_int(message.text or "")
+    value = parse_mileage(message.text or "")
     if value is None or value > 2_000_000:
         await message.answer("Укажите пробег цифрами, например: 85 000.")
         return
